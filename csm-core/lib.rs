@@ -6,7 +6,8 @@ use futures_util::Stream;
 use hf_hub::{api::tokio::Api, Repo, RepoType};
 use moshi::mimi;
 use rand::Rng;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashSet};
+use std::fs;
 use std::pin::Pin;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -73,10 +74,33 @@ impl Generator {
             log::info!("Loading FULL PRECISION model with dtype {:?}", csm_dtype);
             let model_id = args.model_id.unwrap_or_else(|| "sesame/csm-1b".to_string());
             let model_repo = api.repo(Repo::new(model_id, RepoType::Model));
-            let model_path = model_repo.get("model.safetensors").await?;
-            log::info!("Loading weights from: {:?}", model_path);
+
+            let mut safetensors_paths: Vec<PathBuf> = Vec::new();
+            match model_repo.get("model.safetensors.index.json").await {
+                Ok(index_path) => {
+                    log::info!("Found model.safetensors.index.json, loading sharded weights.");
+                    let index_content = fs::read_to_string(&index_path)?;
+                    let json: serde_json::Value = serde_json::from_str(&index_content)?;
+                    let weight_map = json["weight_map"]
+                        .as_object()
+                        .ok_or_else(|| anyhow!("Invalid 'weight_map' in index.json"))?;
+                    let unique_files: HashSet<&str> =
+                        weight_map.values().filter_map(|v| v.as_str()).collect();
+                    for filename in unique_files {
+                        let safetensor_file = model_repo.get(filename).await?;
+                        safetensors_paths.push(safetensor_file);
+                    }
+                }
+                Err(_) => {
+                    log::info!("Could not find 'model.safetensors.index.json'. Assuming single-file model and trying 'model.safetensors'.");
+                    let model_path = model_repo.get("model.safetensors").await?;
+                    safetensors_paths.push(model_path);
+                }
+            }
+
+            log::info!("Loading weights from: {:?}", safetensors_paths);
             let vb =
-                unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], csm_dtype, &device)? };
+                unsafe { VarBuilder::from_mmaped_safetensors(&safetensors_paths, csm_dtype, &device)? };
             CsmModelWrapper::new_full(&config, vb)?
         };
         log::info!(
