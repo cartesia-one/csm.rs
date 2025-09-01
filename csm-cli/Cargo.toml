@@ -24,3 +24,11 @@ hf-hub = "0.4.3"
 tokenizers = "0.21.4"
 candle-core = { version = "0.9.1" }
 candle-nn = { version = "0.9.1" }
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "moshi/cuda"]
+cudnn = ["candle-core/cudnn", "candle-nn/cudnn", "moshi/cuda"]
+mkl = ["candle-core/mkl", "candle-nn/mkl"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+metal = ["candle-core/metal", "candle-nn/metal", "moshi/metal"]
