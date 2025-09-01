@@ -32,6 +32,7 @@ pub struct GeneratorArgs {
     pub quantized_weights: Option<PathBuf>,
     pub model_id: Option<String>,
     pub tokenizer_id: Option<String>,
+    pub index_file: Option<String>,
     pub device: Device,
 }
 
@@ -77,9 +78,10 @@ impl Generator {
             let model_repo = api.repo(Repo::new(model_id, RepoType::Model));
 
             let mut safetensors_paths: Vec<PathBuf> = Vec::new();
-            match model_repo.get("model.safetensors.index.json").await {
+            let index_file: String = args.index_file.clone().unwrap_or_else(|| "model.safetensors.index.json".to_string());
+            match model_repo.get(&index_file).await {
                 Ok(index_path) => {
-                    log::info!("Found model.safetensors.index.json, loading sharded weights.");
+                    log::info!("Found {:?}, loading sharded weights.", args.index_file);
                     let index_content = fs::read_to_string(&index_path)?;
                     let json: serde_json::Value = serde_json::from_str(&index_content)?;
                     let weight_map = json["weight_map"]
@@ -93,7 +95,7 @@ impl Generator {
                     }
                 }
                 Err(_) => {
-                    log::info!("Could not find 'model.safetensors.index.json'. Assuming single-file model and trying 'model.safetensors'.");
+                    log::info!("Could not find index file '{:?}'. Assuming single-file model and trying 'model.safetensors'.", args.index_file);
                     let model_path = model_repo.get("model.safetensors").await?;
                     safetensors_paths.push(model_path);
                 }

@@ -29,6 +29,8 @@ struct Args {
     model_id: Option<String>,
     #[arg(long)]
     tokenizer_id: Option<String>,
+    #[arg(long, default_value = "model.safetensors.index.json")]
+    index_file: Option<String>,
 }
 
 async fn run() -> Result<()> {
@@ -44,6 +46,7 @@ async fn run() -> Result<()> {
         quantized_weights: args.quantized_weights.clone(),
         model_id: args.model_id,
         tokenizer_id: args.tokenizer_id,
+        index_file: args.index_file,
         device,
     };
 
