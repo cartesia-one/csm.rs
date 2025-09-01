@@ -1,0 +1,11 @@
+{
+	"name": "csm.rs",
+	"image": "mcr.microsoft.com/devcontainers/rust:1-1-bullseye",
+	"mounts": [
+		{
+			"source": "${env:HOME}/.cache",
+			"target": "/home/vscode/.cache",
+			"type": "bind"
+		}
+	]
+}

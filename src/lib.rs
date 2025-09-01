@@ -1,0 +1,203 @@
+use anyhow::{Error, Result};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::generation::LogitsProcessor;
+use futures_util::Stream;
+use hf_hub::{api::tokio::Api, Repo, RepoType};
+use moshi::mimi;
+use rand::Rng;
+use std::collections::VecDeque;
+use std::pin::Pin;
+use tokenizers::Tokenizer;
+
+use crate::model::{Csm, CsmModelWrapper};
+
+pub mod csm_full_impl;
+pub mod csm_quantized_impl;
+pub mod model;
+
+pub struct Generator {
+    pub model: CsmModelWrapper,
+    pub audio_tokenizer: mimi::Mimi,
+    text_tokenizer: Tokenizer,
+    device: Device,
+    max_seq_len: usize,
+}
+
+impl Generator {
+    pub async fn new(model: CsmModelWrapper, text_tokenizer: Tokenizer) -> Result<Self> {
+        let device = model.device().clone();
+        let dtype = match &model {
+            CsmModelWrapper::Full(m) => m.backbone.dtype,
+            CsmModelWrapper::Quantized(_) => DType::F32,
+        };
+
+        log::info!("Loading mimi audio tokenizer weights...");
+        let start_mimi_load = std::time::Instant::now();
+        let api = Api::new()?;
+        let repo = api.repo(Repo::new(
+            "kyutai/moshiko-pytorch-bf16".to_string(),
+            RepoType::Model,
+        ));
+        let mimi_weights_path = repo
+            .get("tokenizer-e351c8d8-checkpoint125.safetensors")
+            .await?;
+
+        let num_codebooks_for_decode = model.config().audio_num_codebooks / 2;
+        let mimi_cfg = mimi::Config::v0_1(Some(num_codebooks_for_decode));
+
+        let vb_mimi =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[mimi_weights_path], dtype, &device)? };
+        let audio_tokenizer = mimi::Mimi::new(mimi_cfg, vb_mimi)?;
+        log::info!(
+            "Loaded mimi audio tokenizer in {:.2}s",
+            start_mimi_load.elapsed().as_secs_f64()
+        );
+
+        Ok(Self {
+            max_seq_len: 2048,
+            model,
+            audio_tokenizer,
+            text_tokenizer,
+            device,
+        })
+    }
+
+    fn tokenize_text(&self, text: &str, speaker_id: u32) -> Result<(Tensor, Tensor)> {
+        let formatted_text = format!("<|begin_of_text|>[{speaker_id}]{text}<|end_of_text|>");
+        let text_tokens_encoded = self
+            .text_tokenizer
+            .encode(formatted_text, true)
+            .map_err(Error::msg)?;
+        let ids: &[u32] = text_tokens_encoded.get_ids();
+        Ok(self.model.text_tokens_and_mask(ids)?)
+    }
+    pub fn generate_stream<'a>(
+        &'a mut self,
+        text: &'a str,
+        speaker_id: u32,
+        max_audio_len_ms: f32,
+        temperature: f64,
+        top_k: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<Tensor>> + 'a>> {
+        use async_stream::stream;
+
+        let stream = stream! {
+            let mut lp = LogitsProcessor::from_sampling(
+                rand::thread_rng().gen(),
+                candle_transformers::generation::Sampling::TopK { k: top_k, temperature },
+            );
+
+            self.model.clear_kv_cache();
+
+            let (prompt_tokens, prompt_mask) = match self.tokenize_text(text, speaker_id) {
+                Ok(t) => t,
+                Err(e) => { yield Err(e); return; }
+            };
+
+            let mut frame_buffer: VecDeque<Vec<u32>> = VecDeque::new();
+            let buffer_size = 20;
+
+            let max_gen_len = (max_audio_len_ms / 80.0) as usize;
+            log::info!("Starting generation for up to {} frames...", max_gen_len);
+
+            let mut current_tokens = prompt_tokens;
+            let mut current_mask = prompt_mask;
+            let mut current_pos = 0;
+
+            for i in 0..max_gen_len {
+                log::info!("generating frame {:?} (max: {:?})", i + 1, max_gen_len);
+                let seq_len = current_tokens.dim(1)?;
+                if seq_len > self.max_seq_len {
+                    let start_pos = seq_len - self.max_seq_len;
+                    current_tokens = current_tokens.narrow(1, start_pos, self.max_seq_len)?;
+                    current_mask = current_mask.narrow(1, start_pos, self.max_seq_len)?;
+                }
+
+                let new_frame = match self.model.generate_frame(
+                    &current_tokens,
+                    &current_mask,
+                    current_pos,
+                    &mut lp,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => { yield Err(e.into()); return; }
+                };
+
+                if new_frame.iter().all(|&x| x == 0) {
+                    log::info!("Model signaled end of generation at frame {}. Stopping.", i + 1);
+                    break;
+                }
+
+                current_pos += current_tokens.dim(1)?;
+                let (next_tokens, next_mask) = match self.model.audio_tokens_and_mask(new_frame.clone()) {
+                    Ok(t) => t,
+                    Err(e) => { yield Err(e.into()); return; }
+                };
+
+                current_tokens = next_tokens;
+                current_mask = next_mask;
+
+                frame_buffer.push_back(new_frame);
+
+                if frame_buffer.len() >= buffer_size {
+                        let frames_to_decode: Vec<Vec<u32>> = frame_buffer.drain(..buffer_size).collect();
+                        let audio_chunk = match self.decode_frames(frames_to_decode) {
+                            Ok(chunk) => chunk,
+                            Err(e) => { yield Err(e); return; }
+                        };
+                        yield Ok(audio_chunk.to_device(&Device::Cpu)?);
+                }
+            }
+
+            if !frame_buffer.is_empty() {
+                let frames_to_decode: Vec<Vec<u32>> = frame_buffer.drain(..).collect();
+                let audio_chunk = match self.decode_frames(frames_to_decode) {
+                    Ok(chunk) => chunk,
+                    Err(e) => { yield Err(e); return; }
+                };
+                log::info!("Generated final audio chunk of size {:?}", audio_chunk.shape());
+                yield Ok(audio_chunk.to_device(&Device::Cpu)?);
+            }
+        };
+
+        Box::pin(stream)
+    }
+
+    fn decode_frames(&mut self, frames: Vec<Vec<u32>>) -> Result<Tensor> {
+        let decode_start_time = std::time::Instant::now();
+        if frames.is_empty() {
+            return Ok(Tensor::zeros((0,), DType::F32, &self.device)?);
+        }
+        let num_frames = frames.len();
+        let num_codebooks_to_decode = self.model.config().audio_num_codebooks / 2;
+
+        let mut flat_frames: Vec<u32> = Vec::with_capacity(num_frames * num_codebooks_to_decode);
+        for frame in frames.iter() {
+            flat_frames.extend_from_slice(&frame[..num_codebooks_to_decode]);
+        }
+
+        let frames_tensor = Tensor::from_vec(
+            flat_frames,
+            (num_frames, num_codebooks_to_decode),
+            &self.device,
+        )?
+        .transpose(0, 1)?
+        .unsqueeze(0)?;
+
+        self.audio_tokenizer.reset_state();
+        let audio_output = self
+            .audio_tokenizer
+            .decode(&frames_tensor)?
+            .squeeze(0)?
+            .squeeze(0)?;
+
+        log::info!(
+            "Decoded {} frames in {:.2}ms",
+            num_frames,
+            decode_start_time.elapsed().as_secs_f64() * 1000.0
+        );
+
+        Ok(audio_output)
+    }
+}

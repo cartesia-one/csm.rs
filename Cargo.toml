@@ -1,0 +1,36 @@
+[package]
+name = "csm-rs"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = 1
+
+[lib]
+name = "csm_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "main"
+path = "src/main.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/benchmark.rs"
+
+[dependencies]
+moshi = { version = "0.6.3" }
+candle-core = { version = "0.9.1" }
+candle-nn = { version = "0.9.1" }
+candle-transformers = { version = "0.9.1" }
+anyhow = "1.0.86"
+tokenizers = "0.21.4"
+hf-hub = "0.4.3"
+tokio = { version = "1.38.0", features = ["full"] }
+async-stream = "0.3.5"
+futures-util = "0.3.30"
+log = "0.4.22"
+env_logger = "0.11.3"
+rand = "0.8.5"
+serde = { version = "1.0", features = ["derive"] }
+clap = { version = "4.5.8", features = ["derive"] }
