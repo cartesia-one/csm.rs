@@ -77,7 +77,7 @@ impl Generator {
             let model_repo = api.repo(Repo::new(model_id, RepoType::Model));
 
             let mut safetensors_paths: Vec<PathBuf> = Vec::new();
-            match model_repo.get("transformers.safetensors.index.json").await {
+            match model_repo.get("model.safetensors.index.json").await {
                 Ok(index_path) => {
                     log::info!("Found model.safetensors.index.json, loading sharded weights.");
                     let index_content = fs::read_to_string(&index_path)?;
@@ -104,11 +104,8 @@ impl Generator {
                 VarBuilder::from_mmaped_safetensors(&safetensors_paths, csm_dtype, &device)?
             };
 
-            /*
-            // TODO: auto guess the flavor
             let flavor = {
-                let all_vars = vb.all_vars()?;
-                if all_vars.contains_key("embed_text_tokens.weight") {
+                if vb.contains_tensor("embed_text_tokens.weight"){
                     log::info!("Detected 'Transformers' weight naming convention.");
                     WeightMapFlavor::Transformers
                 } else {
@@ -116,8 +113,6 @@ impl Generator {
                     WeightMapFlavor::Sesame
                 }
             };
-            */
-            let flavor = WeightMapFlavor::Transformers;
 
             CsmModelWrapper::new_full(&config, vb, flavor)?
         };
