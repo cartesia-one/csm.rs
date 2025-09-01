@@ -497,7 +497,7 @@ impl FullModel {
                 ),
                 WeightMapFlavor::Transformers => (
                     "embed_text_tokens",
-                    "backbone_model.embed_tokens.embed_audio_tokens",
+                    "depth_decoder.model.embed_tokens",
                     "depth_decoder.model.inputs_embeds_projector",
                     "lm_head",
                     "depth_decoder.codebooks_head",
