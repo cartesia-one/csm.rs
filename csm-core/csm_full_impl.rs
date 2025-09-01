@@ -100,7 +100,7 @@ impl RotaryEmbedding {
         Ok(Self { cos, sin })
     }
 
-    fn apply_rotary_emb_qkv(
+    fn apply_rotary_emb_qkv_interleaved(
         &self,
         q: &Tensor,
         k: &Tensor,
@@ -111,6 +111,20 @@ impl RotaryEmbedding {
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
         let q_embed = candle_nn::rotary_emb::rope_i(q, &cos, &sin)?;
         let k_embed = candle_nn::rotary_emb::rope_i(k, &cos, &sin)?;
+        Ok((q_embed, k_embed))
+    }
+
+    fn apply_rotary_emb_qkv_non_interleaved(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        let q_embed = candle_nn::rotary_emb::rope(q, &cos, &sin)?;
+        let k_embed = candle_nn::rotary_emb::rope(k, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
 }
@@ -132,6 +146,7 @@ struct Attention {
     head_dim: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
+    flavor: WeightMapFlavor,
 }
 impl Attention {
     fn new(
@@ -164,6 +179,7 @@ impl Attention {
             num_kv_heads: cfg.num_kv_heads,
             num_kv_groups: cfg.num_heads / cfg.num_kv_heads,
             head_dim,
+            flavor,
         })
     }
 
@@ -192,9 +208,20 @@ impl Attention {
             .transpose(1, 2)?
             .contiguous()?;
 
-        let (query_states, key_states) =
-            self.rotary_emb
-                .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
+        let (query_states, key_states) = match self.flavor {
+            WeightMapFlavor::Sesame => self.rotary_emb.apply_rotary_emb_qkv_interleaved(
+                &query_states,
+                &key_states,
+                seqlen_offset,
+            )?,
+            WeightMapFlavor::Transformers => self
+                .rotary_emb
+                .apply_rotary_emb_qkv_non_interleaved(
+                    &query_states,
+                    &key_states,
+                    seqlen_offset,
+                )?,
+        };
 
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
