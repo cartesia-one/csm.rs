@@ -1,14 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use clap::Parser;
-use csm_rs::{
-    model::{Config as CsmModelConfig, Csm, CsmModelWrapper, Flavor},
-    Generator,
-};
+use csm_rs::{Generator, GeneratorArgs};
 use futures_util::StreamExt;
 use std::path::PathBuf;
 use std::time::Instant;
-use tokenizers::Tokenizer;
 
 async fn generate_audio_blocking(
     generator: &mut Generator,
@@ -59,55 +55,22 @@ async fn main() -> Result<()> {
     } else {
         Device::new_cuda(0).unwrap_or(Device::Cpu)
     };
-    let dtype = if device.is_cuda() {
-        DType::BF16
-    } else {
-        DType::F32
-    };
-    log::info!("Using device: {:?} with dtype: {:?}", device, dtype);
-
-    let api = hf_hub::api::tokio::Api::new()?;
-    let tokenizer_repo =
-        api.repo(hf_hub::Repo::new("unsloth/Llama-3.2-1B".to_string(), hf_hub::RepoType::Model));
-    let tokenizer_path = tokenizer_repo.get("tokenizer.json").await?;
-    let text_tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow!(e))?;
 
     log::info!("--- RUNNING BENCHMARK ---");
-
-    let config = CsmModelConfig {
-        backbone_flavor: Flavor::Llama1B,
-        decoder_flavor: Flavor::Llama100M,
-        text_vocab_size: 128256,
-        audio_vocab_size: 2051,
-        audio_num_codebooks: 32,
+    let start_load = std::time::Instant::now();
+    let gen_args = GeneratorArgs {
+        quantized: args.quantized,
+        quantized_weights: args.quantized_weights.clone(),
+        model_id: None,
+        tokenizer_id: None,
+        device: device.clone(),
     };
-
-    let start_model_load = std::time::Instant::now();
-    let mut model = if args.quantized {
-        let qw_path = args
-            .quantized_weights
-            .ok_or_else(|| anyhow!("--quantized-weights must be provided for benchmark"))?;
-        log::info!("Loading quantized weights from: {:?}", qw_path);
-        CsmModelWrapper::new_quantized(&config, &qw_path, &device)?
-    } else {
-        let model_repo = api.repo(hf_hub::Repo::new("sesame/csm-1b".to_string(), hf_hub::RepoType::Model));
-        let model_path = model_repo.get("model.safetensors").await?;
-        log::info!("Loading full precision weights from: {:?}", model_path);
-        let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&[model_path], dtype, &device)? };
-        CsmModelWrapper::new_full(&config, vb)?
-    };
+    let mut generator = Generator::new(gen_args).await?;
     log::info!(
-        "Loaded CSM model in {:.2}s.",
-        start_model_load.elapsed().as_secs_f64()
+        "Initialized generator and all models in {:.2}s.",
+        start_load.elapsed().as_secs_f64()
     );
 
-    model.clear_kv_cache();
-    let start_generator_new = std::time::Instant::now();
-    let mut generator = Generator::new(model, text_tokenizer).await?;
-    log::info!(
-        "Created generator (loaded audio tokenizer) in {:.2}s.",
-        start_generator_new.elapsed().as_secs_f64()
-    );
     let sample_rate = generator.audio_tokenizer.config().sample_rate as f64;
 
     log::info!("Starting {} warm-up runs...", args.warmup_runs);

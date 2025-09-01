@@ -1,4 +1,4 @@
-use anyhow::{Error, Result};
+use anyhow::{anyhow, Error, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
@@ -8,13 +8,14 @@ use moshi::mimi;
 use rand::Rng;
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
-use crate::model::{Csm, CsmModelWrapper};
+mod csm_full_impl;
+mod csm_quantized_impl;
 
-pub mod csm_full_impl;
-pub mod csm_quantized_impl;
-pub mod model;
+mod model;
+use crate::model::{ Csm, CsmModelWrapper};
 
 pub struct Generator {
     pub model: CsmModelWrapper,
@@ -24,17 +25,77 @@ pub struct Generator {
     max_seq_len: usize,
 }
 
+pub struct GeneratorArgs {
+    pub quantized: bool,
+    pub quantized_weights: Option<PathBuf>,
+    pub model_id: Option<String>,
+    pub tokenizer_id: Option<String>,
+    pub device: Device,
+}
+
 impl Generator {
-    pub async fn new(model: CsmModelWrapper, text_tokenizer: Tokenizer) -> Result<Self> {
-        let device = model.device().clone();
-        let dtype = match &model {
+    pub async fn new(args: GeneratorArgs) -> Result<Self> {
+        let device = args.device;
+        let csm_dtype = if device.is_cuda() {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+        log::info!("Using device: {:?} for generation", device);
+
+        let api = Api::new()?;
+
+        log::info!("Loading text tokenizer...");
+        let tokenizer_id = args
+            .tokenizer_id
+            .unwrap_or_else(|| "unsloth/Llama-3.2-1B".to_string());
+        let tokenizer_repo = api.repo(Repo::new(tokenizer_id, RepoType::Model));
+        let tokenizer_path = tokenizer_repo.get("tokenizer.json").await?;
+        let text_tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow!(e))?;
+
+        let config = model::Config {
+            backbone_flavor: model::Flavor::Llama1B,
+            decoder_flavor: model::Flavor::Llama100M,
+            text_vocab_size: 128256,
+            audio_vocab_size: 2051,
+            audio_num_codebooks: 32,
+        };
+
+        log::info!("Loading CSM model...");
+        let start_model_load = std::time::Instant::now();
+        let mut model = if args.quantized {
+            let qw_path = args.quantized_weights.ok_or_else(|| {
+                anyhow!("--quantized-weights must be specified for quantized model")
+            })?;
+            log::info!("Loading QUANTIZED model from {:?}", qw_path);
+            CsmModelWrapper::new_quantized(&config, &qw_path, &device)?
+        } else {
+            log::info!("Loading FULL PRECISION model with dtype {:?}", csm_dtype);
+            let model_id = args.model_id.unwrap_or_else(|| "sesame/csm-1b".to_string());
+            let model_repo = api.repo(Repo::new(model_id, RepoType::Model));
+            let model_path = model_repo.get("model.safetensors").await?;
+            log::info!("Loading weights from: {:?}", model_path);
+            let vb =
+                unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], csm_dtype, &device)? };
+            CsmModelWrapper::new_full(&config, vb)?
+        };
+        log::info!(
+            "Loaded CSM model in {:.2}s.",
+            start_model_load.elapsed().as_secs_f64()
+        );
+
+        model.clear_kv_cache();
+
+        let mimi_dtype = match &model {
             CsmModelWrapper::Full(m) => m.backbone.dtype,
             CsmModelWrapper::Quantized(_) => DType::F32,
         };
 
-        log::info!("Loading mimi audio tokenizer weights...");
+        log::info!(
+            "Loading mimi audio tokenizer weights with dtype {:?}...",
+            mimi_dtype
+        );
         let start_mimi_load = std::time::Instant::now();
-        let api = Api::new()?;
         let repo = api.repo(Repo::new(
             "kyutai/moshiko-pytorch-bf16".to_string(),
             RepoType::Model,
@@ -47,7 +108,7 @@ impl Generator {
         let mimi_cfg = mimi::Config::v0_1(Some(num_codebooks_for_decode));
 
         let vb_mimi =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[mimi_weights_path], dtype, &device)? };
+            unsafe { VarBuilder::from_mmaped_safetensors(&[mimi_weights_path], mimi_dtype, &device)? };
         let audio_tokenizer = mimi::Mimi::new(mimi_cfg, vb_mimi)?;
         log::info!(
             "Loaded mimi audio tokenizer in {:.2}s",
@@ -59,7 +120,7 @@ impl Generator {
             model,
             audio_tokenizer,
             text_tokenizer,
-            device,
+            device: device.clone(),
         })
     }
 
