@@ -1,8 +1,8 @@
 use candle_core::{Device, Result, Tensor};
-use candle_nn::{VarBuilder};
+use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 
-use crate::csm_full_impl::FullModel;
+use crate::csm_full_impl::{FullModel, WeightMapFlavor};
 use crate::csm_quantized_impl::QuantizedCsmModel;
 
 #[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,8 +48,8 @@ pub enum CsmModelWrapper {
 }
 
 impl CsmModelWrapper {
-    pub fn new_full(config: &Config, vb: VarBuilder) -> Result<Self> {
-        Ok(CsmModelWrapper::Full(FullModel::new(config, vb)?))
+    pub fn new_full(config: &Config, vb: VarBuilder, flavor: WeightMapFlavor) -> Result<Self> {
+        Ok(CsmModelWrapper::Full(FullModel::new(config, vb, flavor)?))
     }
 
     pub fn new_quantized<P: AsRef<std::path::Path>>(

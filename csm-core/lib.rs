@@ -6,17 +6,18 @@ use futures_util::Stream;
 use hf_hub::{api::tokio::Api, Repo, RepoType};
 use moshi::mimi;
 use rand::Rng;
-use std::collections::{VecDeque, HashSet};
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::pin::Pin;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
 mod csm_full_impl;
+use crate::csm_full_impl::WeightMapFlavor;
 mod csm_quantized_impl;
 
 mod model;
-use crate::model::{ Csm, CsmModelWrapper};
+use crate::model::{Csm, CsmModelWrapper};
 
 pub struct Generator {
     pub model: CsmModelWrapper,
@@ -76,7 +77,7 @@ impl Generator {
             let model_repo = api.repo(Repo::new(model_id, RepoType::Model));
 
             let mut safetensors_paths: Vec<PathBuf> = Vec::new();
-            match model_repo.get("model.safetensors.index.json").await {
+            match model_repo.get("transformers.safetensors.index.json").await {
                 Ok(index_path) => {
                     log::info!("Found model.safetensors.index.json, loading sharded weights.");
                     let index_content = fs::read_to_string(&index_path)?;
@@ -99,9 +100,26 @@ impl Generator {
             }
 
             log::info!("Loading weights from: {:?}", safetensors_paths);
-            let vb =
-                unsafe { VarBuilder::from_mmaped_safetensors(&safetensors_paths, csm_dtype, &device)? };
-            CsmModelWrapper::new_full(&config, vb)?
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&safetensors_paths, csm_dtype, &device)?
+            };
+
+            /*
+            // TODO: auto guess the flavor
+            let flavor = {
+                let all_vars = vb.all_vars()?;
+                if all_vars.contains_key("embed_text_tokens.weight") {
+                    log::info!("Detected 'Transformers' weight naming convention.");
+                    WeightMapFlavor::Transformers
+                } else {
+                    log::info!("Assuming 'Sesame' weight naming convention.");
+                    WeightMapFlavor::Sesame
+                }
+            };
+            */
+            let flavor = WeightMapFlavor::Transformers;
+
+            CsmModelWrapper::new_full(&config, vb, flavor)?
         };
         log::info!(
             "Loaded CSM model in {:.2}s.",

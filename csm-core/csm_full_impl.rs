@@ -4,6 +4,12 @@ use candle_nn::{embedding, linear_b, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::generation::LogitsProcessor;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightMapFlavor {
+    Sesame,
+    Transformers,
+}
+
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
     num_layers: usize,
@@ -108,10 +114,12 @@ impl RotaryEmbedding {
         Ok((q_embed, k_embed))
     }
 }
-fn rms_norm(hidden_size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
-    let weight = vb.get((hidden_size,), "scale")?;
+
+fn rms_norm(hidden_size: usize, eps: f64, vb: VarBuilder, tensor_name: &str) -> Result<RmsNorm> {
+    let weight = vb.get((hidden_size,), tensor_name)?;
     Ok(RmsNorm::new(weight, eps))
 }
+
 #[derive(Debug, Clone)]
 struct Attention {
     q_proj: Linear,
@@ -126,14 +134,25 @@ struct Attention {
     num_kv_groups: usize,
 }
 impl Attention {
-    fn new(cfg: &LlamaConfig, rotary_emb: Arc<RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        cfg: &LlamaConfig,
+        rotary_emb: Arc<RotaryEmbedding>,
+        vb: VarBuilder,
+        flavor: WeightMapFlavor,
+    ) -> Result<Self> {
         let head_dim = cfg.embed_dim / cfg.num_heads;
         let kv_dim = cfg.num_kv_heads * head_dim;
 
         let q_proj = linear_b(cfg.embed_dim, cfg.embed_dim, false, vb.pp("q_proj"))?;
         let k_proj = linear_b(cfg.embed_dim, kv_dim, false, vb.pp("k_proj"))?;
         let v_proj = linear_b(cfg.embed_dim, kv_dim, false, vb.pp("v_proj"))?;
-        let o_proj = linear_b(cfg.embed_dim, cfg.embed_dim, false, vb.pp("output_proj"))?;
+
+        let o_proj_name = match flavor {
+            WeightMapFlavor::Sesame => "output_proj",
+            WeightMapFlavor::Transformers => "o_proj",
+        };
+        let o_proj = linear_b(cfg.embed_dim, cfg.embed_dim, false, vb.pp(o_proj_name))?;
+
         Ok(Self {
             q_proj,
             k_proj,
@@ -188,7 +207,8 @@ impl Attention {
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
         let key_states = candle_transformers::utils::repeat_kv(key_states, self.num_kv_groups)?;
-        let value_states = candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?;
+        let value_states =
+            candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?;
 
         let attn_output = {
             let scale = 1f64 / f64::sqrt(self.head_dim as f64);
@@ -212,26 +232,73 @@ impl Attention {
     }
 }
 #[derive(Debug, Clone)]
-struct Mlp {
-    w1: Linear,
-    w2: Linear,
-    w3: Linear,
+enum MlpImpl {
+    Sesame {
+        w1: Linear,
+        w2: Linear,
+        w3: Linear,
+    },
+    Transformers {
+        gate_proj: Linear,
+        up_proj: Linear,
+        down_proj: Linear,
+    },
 }
+
+#[derive(Debug, Clone)]
+struct Mlp {
+    inner: MlpImpl,
+}
+
 impl Mlp {
-    fn new(cfg: &LlamaConfig, vb: VarBuilder) -> Result<Self> {
-        let w1 = linear_b(cfg.embed_dim, cfg.intermediate_dim, false, vb.pp("w1"))?;
-        let w2 = linear_b(cfg.intermediate_dim, cfg.embed_dim, false, vb.pp("w2"))?;
-        let w3 = linear_b(cfg.embed_dim, cfg.intermediate_dim, false, vb.pp("w3"))?;
-        Ok(Self { w1, w2, w3 })
+    fn new(cfg: &LlamaConfig, vb: VarBuilder, flavor: WeightMapFlavor) -> Result<Self> {
+        let inner = match flavor {
+            WeightMapFlavor::Sesame => MlpImpl::Sesame {
+                w1: linear_b(cfg.embed_dim, cfg.intermediate_dim, false, vb.pp("w1"))?,
+                w2: linear_b(cfg.intermediate_dim, cfg.embed_dim, false, vb.pp("w2"))?,
+                w3: linear_b(cfg.embed_dim, cfg.intermediate_dim, false, vb.pp("w3"))?,
+            },
+            WeightMapFlavor::Transformers => MlpImpl::Transformers {
+                gate_proj: linear_b(
+                    cfg.embed_dim,
+                    cfg.intermediate_dim,
+                    false,
+                    vb.pp("gate_proj"),
+                )?,
+                up_proj: linear_b(cfg.embed_dim, cfg.intermediate_dim, false, vb.pp("up_proj"))?,
+                down_proj: linear_b(
+                    cfg.intermediate_dim,
+                    cfg.embed_dim,
+                    false,
+                    vb.pp("down_proj"),
+                )?,
+            },
+        };
+        Ok(Self { inner })
     }
 }
+
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = xs.apply(&self.w1)?.silu()?;
-        let rhs = xs.apply(&self.w3)?;
-        (lhs * rhs)?.apply(&self.w2)
+        match &self.inner {
+            MlpImpl::Sesame { w1, w2, w3 } => {
+                let lhs = xs.apply(w1)?.silu()?;
+                let rhs = xs.apply(w3)?;
+                (lhs * rhs)?.apply(w2)
+            }
+            MlpImpl::Transformers {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                let gate = xs.apply(gate_proj)?.silu()?;
+                let up = xs.apply(up_proj)?;
+                (gate * up)?.apply(down_proj)
+            }
+        }
     }
 }
+
 #[derive(Debug, Clone)]
 struct Layer {
     mlp_norm: RmsNorm,
@@ -240,11 +307,31 @@ struct Layer {
     mlp: Mlp,
 }
 impl Layer {
-    fn new(cfg: &LlamaConfig, rotary_emb: Arc<RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
-        let mlp_norm = rms_norm(cfg.embed_dim, cfg.norm_eps, vb.pp("mlp_norm"))?;
-        let sa_norm = rms_norm(cfg.embed_dim, cfg.norm_eps, vb.pp("sa_norm"))?;
-        let attn = Attention::new(cfg, rotary_emb, vb.pp("attn"))?;
-        let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
+    fn new(
+        cfg: &LlamaConfig,
+        rotary_emb: Arc<RotaryEmbedding>,
+        vb: VarBuilder,
+        flavor: WeightMapFlavor,
+    ) -> Result<Self> {
+        let (sa_norm_name, mlp_norm_name, norm_tensor_name) = match flavor {
+            WeightMapFlavor::Sesame => ("sa_norm", "mlp_norm", "scale"),
+            WeightMapFlavor::Transformers => ("input_layernorm", "post_attention_layernorm", "weight"),
+        };
+        let attn_name = match flavor {
+            WeightMapFlavor::Sesame => "attn",
+            WeightMapFlavor::Transformers => "self_attn",
+        };
+
+        let mlp_norm =
+            rms_norm(cfg.embed_dim, cfg.norm_eps, vb.pp(mlp_norm_name), norm_tensor_name)?;
+        let sa_norm = rms_norm(
+            cfg.embed_dim,
+            cfg.norm_eps,
+            vb.pp(sa_norm_name),
+            norm_tensor_name,
+        )?;
+        let attn = Attention::new(cfg, rotary_emb, vb.pp(attn_name), flavor)?;
+        let mlp = Mlp::new(cfg, vb.pp("mlp"), flavor)?;
         Ok(Self {
             mlp_norm,
             sa_norm,
@@ -281,15 +368,21 @@ pub struct LlamaModel {
     pub dtype: DType,
 }
 impl LlamaModel {
-    pub fn new(cfg: &LlamaConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &LlamaConfig, vb: VarBuilder, flavor: WeightMapFlavor) -> Result<Self> {
         let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
         let mut layers = Vec::with_capacity(cfg.num_layers);
         let vb_l = vb.pp("layers");
         for layer_idx in 0..cfg.num_layers {
-            let layer = Layer::new(cfg, rotary_emb.clone(), vb_l.pp(layer_idx))?;
+            let layer = Layer::new(cfg, rotary_emb.clone(), vb_l.pp(layer_idx), flavor)?;
             layers.push(layer);
         }
-        let norm = rms_norm(cfg.embed_dim, cfg.norm_eps, vb.pp("norm"))?;
+
+        let norm_tensor_name = match flavor {
+            WeightMapFlavor::Sesame => "scale",
+            WeightMapFlavor::Transformers => "weight",
+        };
+        let norm = rms_norm(cfg.embed_dim, cfg.norm_eps, vb.pp("norm"), norm_tensor_name)?;
+
         Ok(Self {
             layers,
             norm,
@@ -351,34 +444,64 @@ pub struct FullModel {
 }
 
 impl FullModel {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, vb: VarBuilder, flavor: WeightMapFlavor) -> Result<Self> {
+        let (backbone_prefix, decoder_prefix) = match flavor {
+            WeightMapFlavor::Sesame => ("backbone", "decoder"),
+            WeightMapFlavor::Transformers => ("backbone_model", "depth_decoder.model"),
+        };
+
         let backbone_cfg = LlamaConfig::from_flavor(cfg.backbone_flavor);
-        let backbone = LlamaModel::new(&backbone_cfg, vb.pp("backbone"))?;
+        let backbone = LlamaModel::new(&backbone_cfg, vb.pp(backbone_prefix), flavor)?;
+
         let decoder_cfg = LlamaConfig::from_flavor(cfg.decoder_flavor);
-        let decoder = LlamaModel::new(&decoder_cfg, vb.pp("decoder"))?;
+        let decoder = LlamaModel::new(&decoder_cfg, vb.pp(decoder_prefix), flavor)?;
+
         let backbone_dim = backbone_cfg.embed_dim;
         let decoder_dim = decoder_cfg.embed_dim;
+
+        let (text_embed_name, audio_embed_name, proj_name, c0_head_name, audio_head_name) =
+            match flavor {
+                WeightMapFlavor::Sesame => (
+                    "text_embeddings",
+                    "audio_embeddings",
+                    "projection",
+                    "codebook0_head",
+                    "audio_head",
+                ),
+                WeightMapFlavor::Transformers => (
+                    "embed_text_tokens",
+                    "depth_decoder.model.embed_tokens",
+                    "depth_decoder.model.inputs_embeds_projector",
+                    "lm_head",
+                    "depth_decoder.codebooks_head",
+                ),
+            };
+
         let audio_embeddings = embedding(
             cfg.audio_vocab_size * cfg.audio_num_codebooks,
             backbone_dim,
-            vb.pp("audio_embeddings"),
+            vb.pp(audio_embed_name),
         )?;
+
         let text_embeddings =
-            embedding(cfg.text_vocab_size, backbone_dim, vb.pp("text_embeddings"))?;
-        let projection = linear_b(backbone_dim, decoder_dim, false, vb.pp("projection"))?;
-        let codebook0_head = linear_b(
-            backbone_dim,
-            cfg.audio_vocab_size,
-            false,
-            vb.pp("codebook0_head"),
-        )?;
+            embedding(cfg.text_vocab_size, backbone_dim, vb.pp(text_embed_name))?;
+
+        let projection = linear_b(backbone_dim, decoder_dim, false, vb.pp(proj_name))?;
+
+        let codebook0_head =
+            linear_b(backbone_dim, cfg.audio_vocab_size, false, vb.pp(c0_head_name))?;
+
+        let audio_head_tensor_name = match flavor {
+            WeightMapFlavor::Sesame => audio_head_name.to_string(),
+            WeightMapFlavor::Transformers => format!("{}.weight", audio_head_name),
+        };
         let audio_head = vb.get(
             (
                 cfg.audio_num_codebooks - 1,
                 decoder_dim,
                 cfg.audio_vocab_size,
             ),
-            "audio_head",
+            &audio_head_tensor_name,
         )?;
 
         Ok(Self {
