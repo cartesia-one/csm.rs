@@ -38,8 +38,6 @@ pub trait Csm {
     fn text_tokens_and_mask(&self, ids: &[u32]) -> Result<(Tensor, Tensor)>;
 
     fn config(&self) -> &Config;
-
-    fn device(&self) -> &Device;
 }
 
 pub enum CsmModelWrapper {
@@ -102,13 +100,6 @@ impl Csm for CsmModelWrapper {
         match self {
             CsmModelWrapper::Full(m) => m.config(),
             CsmModelWrapper::Quantized(m) => m.config(),
-        }
-    }
-
-    fn device(&self) -> &Device {
-        match self {
-            CsmModelWrapper::Full(m) => m.device(),
-            CsmModelWrapper::Quantized(m) => m.device(),
         }
     }
 }

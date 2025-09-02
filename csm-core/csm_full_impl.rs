@@ -695,8 +695,4 @@ impl Csm for FullModel {
     fn config(&self) -> &Config {
         &self.config
     }
-
-    fn device(&self) -> &Device {
-        &self.backbone.device
-    }
 }

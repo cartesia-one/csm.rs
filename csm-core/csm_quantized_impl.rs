@@ -728,8 +728,4 @@ impl Csm for QuantizedCsmModel {
     fn config(&self) -> &Config {
         &self.config
     }
-
-    fn device(&self) -> &Device {
-        &self.backbone.device
-    }
 }
