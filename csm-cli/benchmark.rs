@@ -12,10 +12,11 @@ async fn generate_audio_blocking(
     speaker_id: u32,
     temperature: f64,
     top_k: usize,
+    tokenizer_template: Option<String>,
 ) -> Result<Tensor> {
     let max_len_ms = 1000.0;
     let mut stream =
-        generator.generate_stream(text, speaker_id, max_len_ms, temperature, top_k);
+        generator.generate_stream(text, speaker_id, max_len_ms, temperature, top_k, tokenizer_template);
     let mut chunks = vec![];
     while let Some(res) = stream.next().await {
         chunks.push(res?);
@@ -53,6 +54,8 @@ struct Args {
     model_id: Option<String>,
     #[arg(long)]
     tokenizer_id: Option<String>,
+    #[arg(long)]
+    tokenizer_template: Option<String>,
     #[arg(long)]
     index_file: Option<String>,
 }
@@ -94,6 +97,7 @@ async fn main() -> Result<()> {
             args.speaker_id,
             args.temperature,
             args.top_k,
+            args.tokenizer_template.clone(),
         )
         .await?;
         log::info!("Warm-up run {}/{} complete.", i + 1, args.warmup_runs);
@@ -111,6 +115,7 @@ async fn main() -> Result<()> {
             args.speaker_id,
             args.temperature,
             args.top_k,
+            args.tokenizer_template.clone(),
         )
         .await?;
         let elapsed = start_time.elapsed();

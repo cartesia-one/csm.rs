@@ -29,6 +29,8 @@ struct Args {
     model_id: Option<String>,
     #[arg(long)]
     tokenizer_id: Option<String>,
+    #[arg(long)]
+    tokenizer_template: Option<String>,
     #[arg(long, default_value = "model.safetensors.index.json")]
     index_file: Option<String>,
 }
@@ -65,6 +67,7 @@ async fn run() -> Result<()> {
         args.max_audio_len_ms,
         args.temperature,
         args.top_k,
+        args.tokenizer_template.clone(),
     );
 
     let mut all_audio_chunks = vec![];

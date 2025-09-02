@@ -163,8 +163,14 @@ impl Generator {
         })
     }
 
-    fn tokenize_text(&self, text: &str, speaker_id: u32) -> Result<(Tensor, Tensor)> {
-        let formatted_text = format!("<|begin_of_text|>[{speaker_id}]{text}<|end_of_text|>");
+    fn tokenize_text(&self, text: &str, speaker_id: u32, template: Option<&str>) -> Result<(Tensor, Tensor)> {
+        let formatted_text = if let Some(template) = template {
+            template
+                .replace("{speaker_id}", &speaker_id.to_string())
+                .replace("{text}", text)
+        } else {
+            format!("<|begin_of_text|>[{speaker_id}]{text}<|end_of_text|>")
+        };
         let text_tokens_encoded = self
             .text_tokenizer
             .encode(formatted_text, true)
@@ -179,6 +185,7 @@ impl Generator {
         max_audio_len_ms: f32,
         temperature: f64,
         top_k: usize,
+        tokenizer_template: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<Tensor>> + 'a>> {
         use async_stream::stream;
 
@@ -190,7 +197,7 @@ impl Generator {
 
             self.model.clear_kv_cache();
 
-            let (prompt_tokens, prompt_mask) = match self.tokenize_text(text, speaker_id) {
+            let (prompt_tokens, prompt_mask) = match self.tokenize_text(text, speaker_id, tokenizer_template.as_deref()) {
                 Ok(t) => t,
                 Err(e) => { yield Err(e); return; }
             };
