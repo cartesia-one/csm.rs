@@ -185,6 +185,7 @@ impl Generator {
         max_audio_len_ms: f32,
         temperature: f64,
         top_k: usize,
+        buffer_size: usize,
         tokenizer_template: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<Tensor>> + 'a>> {
         use async_stream::stream;
@@ -203,7 +204,6 @@ impl Generator {
             };
 
             let mut frame_buffer: VecDeque<Vec<u32>> = VecDeque::new();
-            let buffer_size = 20;
 
             let max_gen_len = (max_audio_len_ms / 80.0) as usize;
             log::info!("Starting generation for up to {} frames...", max_gen_len);

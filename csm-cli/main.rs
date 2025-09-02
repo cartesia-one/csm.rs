@@ -21,6 +21,8 @@ struct Args {
     top_k: usize,
     #[arg(long, default_value_t = 30000.0)]
     max_audio_len_ms: f32,
+    #[arg(long, default_value_t = 20)]
+    buffer_size: usize,
     #[arg(long, default_value_t = false)]
     quantized: bool,
     #[arg(long)]
@@ -67,6 +69,7 @@ async fn run() -> Result<()> {
         args.max_audio_len_ms,
         args.temperature,
         args.top_k,
+        args.buffer_size,
         args.tokenizer_template.clone(),
     );
 

@@ -12,11 +12,12 @@ async fn generate_audio_blocking(
     speaker_id: u32,
     temperature: f64,
     top_k: usize,
+    buffer_size: usize,
     tokenizer_template: Option<String>,
 ) -> Result<Tensor> {
     let max_len_ms = 1000.0;
     let mut stream =
-        generator.generate_stream(text, speaker_id, max_len_ms, temperature, top_k, tokenizer_template);
+        generator.generate_stream(text, speaker_id, max_len_ms, temperature, top_k, buffer_size, tokenizer_template);
     let mut chunks = vec![];
     while let Some(res) = stream.next().await {
         chunks.push(res?);
@@ -40,6 +41,8 @@ struct Args {
     temperature: f64,
     #[arg(long, default_value_t = 100)]
     top_k: usize,
+    #[arg(long, default_value_t = 20)]
+    buffer_size: usize,
     #[arg(short, long, default_value_t = 1)]
     warmup_runs: u32,
     #[arg(short, long, default_value_t = 5)]
@@ -97,6 +100,7 @@ async fn main() -> Result<()> {
             args.speaker_id,
             args.temperature,
             args.top_k,
+            args.buffer_size,
             args.tokenizer_template.clone(),
         )
         .await?;
@@ -115,6 +119,7 @@ async fn main() -> Result<()> {
             args.speaker_id,
             args.temperature,
             args.top_k,
+            args.buffer_size,
             args.tokenizer_template.clone(),
         )
         .await?;
@@ -154,7 +159,7 @@ fn print_results(
     let rtf = avg_gen_time_s / avg_audio_len_s;
     let throughput = avg_audio_len_s / avg_gen_time_s;
 
-    println!("Model: CSM-1B ({:?})", device.location());
+    println!("Device: {:?}", device.location());
     println!("Number of runs: {}", num_runs);
     println!("Average audio generated: {:.2} seconds", avg_audio_len_s);
     println!("Average generation time: {:.2} seconds", avg_gen_time_s);
