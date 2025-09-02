@@ -6,6 +6,12 @@ use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::quantized_var_builder::VarBuilder as QVarBuilder;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightMapFlavor {
+    Sesame,
+    Transformers,
+}
+
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
     num_layers: usize,
@@ -93,7 +99,7 @@ impl RotaryEmbedding {
         Ok(Self { cos, sin })
     }
 
-    fn apply_rotary_emb_qkv(
+    fn apply_rotary_emb_qkv_interleaved(
         &self,
         q: &Tensor,
         k: &Tensor,
@@ -106,12 +112,25 @@ impl RotaryEmbedding {
         let k_embed = candle_nn::rotary_emb::rope_i(k, &cos, &sin)?;
         Ok((q_embed, k_embed))
     }
+
+    fn apply_rotary_emb_qkv_non_interleaved(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
+        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        let q_embed = candle_nn::rotary_emb::rope(q, &cos, &sin)?;
+        let k_embed = candle_nn::rotary_emb::rope(k, &cos, &sin)?;
+        Ok((q_embed, k_embed))
+    }
 }
-fn rms_norm(eps: f64, vb: &QVarBuilder) -> Result<RmsNorm> {
-    let weight = vb.get_no_shape("scale")?.dequantize(vb.device())?;
+fn rms_norm(eps: f64, vb: &QVarBuilder, tensor_name: &str) -> Result<RmsNorm> {
+    let weight = vb.get_no_shape(tensor_name)?.dequantize(vb.device())?;
     Ok(RmsNorm::new(weight, eps))
 }
-
 
 #[derive(Debug, Clone)]
 struct QLinear {
@@ -157,14 +176,26 @@ struct Attention {
     head_dim: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
+    flavor: WeightMapFlavor,
 }
 impl Attention {
-    fn new(cfg: &LlamaConfig, rotary_emb: Arc<RotaryEmbedding>, vb: &QVarBuilder) -> Result<Self> {
+    fn new(
+        cfg: &LlamaConfig,
+        rotary_emb: Arc<RotaryEmbedding>,
+        vb: &QVarBuilder,
+        flavor: WeightMapFlavor,
+    ) -> Result<Self> {
         let head_dim = cfg.embed_dim / cfg.num_heads;
         let q_proj = QLinear::from_vb("q_proj".to_string(), &vb)?;
         let k_proj = QLinear::from_vb("k_proj".to_string(), &vb)?;
         let v_proj = QLinear::from_vb("v_proj".to_string(), &vb)?;
-        let o_proj = QLinear::from_vb("output_proj".to_string(), &vb)?;
+
+        let o_proj_name = match flavor {
+            WeightMapFlavor::Sesame => "output_proj",
+            WeightMapFlavor::Transformers => "o_proj",
+        };
+        let o_proj = QLinear::from_vb(o_proj_name.to_string(), &vb)?;
+
         Ok(Self {
             q_proj,
             k_proj,
@@ -176,6 +207,7 @@ impl Attention {
             num_kv_heads: cfg.num_kv_heads,
             num_kv_groups: cfg.num_heads / cfg.num_kv_heads,
             head_dim,
+            flavor,
         })
     }
 
@@ -204,9 +236,20 @@ impl Attention {
             .transpose(1, 2)?
             .contiguous()?;
 
-        let (query_states, key_states) = self
-            .rotary_emb
-            .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
+        let (query_states, key_states) = match self.flavor {
+            WeightMapFlavor::Sesame => self.rotary_emb.apply_rotary_emb_qkv_interleaved(
+                &query_states,
+                &key_states,
+                seqlen_offset,
+            )?,
+            WeightMapFlavor::Transformers => self
+                .rotary_emb
+                .apply_rotary_emb_qkv_non_interleaved(
+                    &query_states,
+                    &key_states,
+                    seqlen_offset,
+                )?,
+        };
 
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
@@ -244,23 +287,57 @@ impl Attention {
     }
 }
 #[derive(Debug, Clone)]
+enum MlpImpl {
+    Sesame {
+        w1: QLinear,
+        w2: QLinear,
+        w3: QLinear,
+    },
+    Transformers {
+        gate_proj: QLinear,
+        up_proj: QLinear,
+        down_proj: QLinear,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct Mlp {
-    w1: QLinear,
-    w2: QLinear,
-    w3: QLinear,
+    inner: MlpImpl,
 }
 impl Mlp {
-    fn new(_cfg: &LlamaConfig, vb: &QVarBuilder) -> Result<Self> {
-        let w1 = QLinear::from_vb("w1".to_string(), vb)?;
-        let w2 = QLinear::from_vb("w2".to_string(), vb)?;
-        let w3 = QLinear::from_vb("w3".to_string(), vb)?;
-        Ok(Self { w1, w2, w3 })
+    fn new(_cfg: &LlamaConfig, vb: &QVarBuilder, flavor: WeightMapFlavor) -> Result<Self> {
+        let inner = match flavor {
+            WeightMapFlavor::Sesame => MlpImpl::Sesame {
+                w1: QLinear::from_vb("w1".to_string(), vb)?,
+                w2: QLinear::from_vb("w2".to_string(), vb)?,
+                w3: QLinear::from_vb("w3".to_string(), vb)?,
+            },
+            WeightMapFlavor::Transformers => MlpImpl::Transformers {
+                gate_proj: QLinear::from_vb("gate_proj".to_string(), vb)?,
+                up_proj: QLinear::from_vb("up_proj".to_string(), vb)?,
+                down_proj: QLinear::from_vb("down_proj".to_string(), vb)?,
+            },
+        };
+        Ok(Self { inner })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = self.w1.forward(xs)?.silu()?;
-        let rhs = self.w3.forward(xs)?;
-        self.w2.forward(&(lhs * rhs)?)
+        match &self.inner {
+            MlpImpl::Sesame { w1, w2, w3 } => {
+                let lhs = w1.forward(xs)?.silu()?;
+                let rhs = w3.forward(xs)?;
+                w2.forward(&(lhs * rhs)?)
+            }
+            MlpImpl::Transformers {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                let gate = gate_proj.forward(xs)?.silu()?;
+                let up = up_proj.forward(xs)?;
+                down_proj.forward(&(gate * up)?)
+            }
+        }
     }
 }
 #[derive(Debug, Clone)]
@@ -271,11 +348,25 @@ struct Layer {
     mlp: Mlp,
 }
 impl Layer {
-    fn new(cfg: &LlamaConfig, rotary_emb: Arc<RotaryEmbedding>, vb: &QVarBuilder) -> Result<Self> {
-        let mlp_norm = rms_norm(cfg.norm_eps, &vb.pp("mlp_norm"))?;
-        let sa_norm = rms_norm(cfg.norm_eps, &vb.pp("sa_norm"))?;
-        let attn = Attention::new(cfg, rotary_emb, &vb.pp("attn"))?;
-        let mlp = Mlp::new(cfg, &vb.pp("mlp"))?;
+    fn new(
+        cfg: &LlamaConfig,
+        rotary_emb: Arc<RotaryEmbedding>,
+        vb: &QVarBuilder,
+        flavor: WeightMapFlavor,
+    ) -> Result<Self> {
+        let (sa_norm_name, mlp_norm_name, norm_tensor_name) = match flavor {
+            WeightMapFlavor::Sesame => ("sa_norm", "mlp_norm", "scale"),
+            WeightMapFlavor::Transformers => ("input_layernorm", "post_attention_layernorm", "weight"),
+        };
+        let attn_name = match flavor {
+            WeightMapFlavor::Sesame => "attn",
+            WeightMapFlavor::Transformers => "self_attn",
+        };
+
+        let mlp_norm = rms_norm(cfg.norm_eps, &vb.pp(mlp_norm_name), norm_tensor_name)?;
+        let sa_norm = rms_norm(cfg.norm_eps, &vb.pp(sa_norm_name), norm_tensor_name)?;
+        let attn = Attention::new(cfg, rotary_emb, &vb.pp(attn_name), flavor)?;
+        let mlp = Mlp::new(cfg, &vb.pp("mlp"), flavor)?;
         Ok(Self {
             mlp_norm,
             sa_norm,
@@ -313,11 +404,17 @@ pub struct LlamaModel {
     pub dtype: DType,
 }
 impl LlamaModel {
-    pub fn new(cfg: &LlamaConfig, vb: &QVarBuilder) -> Result<Self> {
+    pub fn new(cfg: &LlamaConfig, vb: &QVarBuilder, flavor: WeightMapFlavor) -> Result<Self> {
         let device = vb.device();
-        let norm_weight = vb
-            .pp("norm")
-            .get_no_shape("scale")?
+
+        let norm_tensor_name = match flavor {
+            WeightMapFlavor::Sesame => "scale",
+            WeightMapFlavor::Transformers => "weight",
+        };
+
+        let norm_vb = vb.pp("norm");
+        let norm_weight = norm_vb
+            .get_no_shape(norm_tensor_name)?
             .dequantize(device)?;
         let dtype = norm_weight.dtype();
         let norm = RmsNorm::new(norm_weight, cfg.norm_eps);
@@ -326,7 +423,7 @@ impl LlamaModel {
         let mut layers = Vec::with_capacity(cfg.num_layers);
         let vb_l = vb.pp("layers");
         for layer_idx in 0..cfg.num_layers {
-            let layer = Layer::new(cfg, rotary_emb.clone(), &vb_l.pp(layer_idx))?;
+            let layer = Layer::new(cfg, rotary_emb.clone(), &vb_l.pp(layer_idx), flavor)?;
             layers.push(layer);
         }
         Ok(Self {
@@ -396,15 +493,47 @@ impl QuantizedCsmModel {
         device: &Device,
     ) -> Result<Self> {
         let vb = QVarBuilder::from_gguf(p, device)?;
-        Self::new(cfg, &vb)
+        let flavor = {
+            if vb.contains_key("embed_text_tokens.weight") {
+                log::info!("Detected 'Transformers' weight naming convention.");
+                WeightMapFlavor::Transformers
+            } else {
+                log::info!("Assuming 'Sesame' weight naming convention.");
+                WeightMapFlavor::Sesame
+            }
+        };
+        Self::new(cfg, &vb, flavor)
     }
 
-    pub fn new(cfg: &Config, vb: &QVarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, vb: &QVarBuilder, flavor: WeightMapFlavor) -> Result<Self> {
+        let (backbone_prefix, decoder_prefix) = match flavor {
+            WeightMapFlavor::Sesame => ("backbone", "decoder"),
+            WeightMapFlavor::Transformers => ("backbone_model", "depth_decoder.model"),
+        };
+
         let backbone_cfg = LlamaConfig::from_flavor(cfg.backbone_flavor);
-        let backbone = LlamaModel::new(&backbone_cfg, &vb.pp("backbone"))?;
+        let backbone = LlamaModel::new(&backbone_cfg, &vb.pp(backbone_prefix), flavor)?;
         let decoder_cfg = LlamaConfig::from_flavor(cfg.decoder_flavor);
-        let decoder = LlamaModel::new(&decoder_cfg, &vb.pp("decoder"))?;
+        let decoder = LlamaModel::new(&decoder_cfg, &vb.pp(decoder_prefix), flavor)?;
         let backbone_dim = backbone_cfg.embed_dim;
+
+        let (text_embed_name, audio_embed_name, proj_name, c0_head_name, audio_head_tensor_name) =
+            match flavor {
+                WeightMapFlavor::Sesame => (
+                    "text_embeddings.weight",
+                    "audio_embeddings.weight",
+                    "projection".to_string(),
+                    "codebook0_head".to_string(),
+                    "audio_head".to_string(),
+                ),
+                WeightMapFlavor::Transformers => (
+                    "embed_text_tokens.weight",
+                    "depth_decoder.model.embed_tokens.weight",
+                    "depth_decoder.model.inputs_embeds_projector".to_string(),
+                    "lm_head".to_string(),
+                    "depth_decoder.codebooks_head.weight".to_string(),
+                ),
+            };
 
         let audio_embeddings_w = vb
             .get(
@@ -412,22 +541,22 @@ impl QuantizedCsmModel {
                     cfg.audio_vocab_size * cfg.audio_num_codebooks,
                     backbone_dim,
                 ),
-                "audio_embeddings.weight",
+                audio_embed_name,
             )?
             .dequantize(vb.device())?;
 
         let text_embeddings_w = vb
             .get(
                 (cfg.text_vocab_size, backbone_dim),
-                "text_embeddings.weight",
+                text_embed_name,
             )?
             .dequantize(vb.device())?;
 
         let audio_embeddings = Embedding::new(audio_embeddings_w, backbone_dim);
         let text_embeddings = Embedding::new(text_embeddings_w, backbone_dim);
 
-        let projection = QLinear::from_vb("projection".to_string(), &vb)?;
-        let codebook0_head = QLinear::from_vb("codebook0_head".to_string(), &vb)?;
+        let projection = QLinear::from_vb(proj_name, &vb)?;
+        let codebook0_head = QLinear::from_vb(c0_head_name, &vb)?;
 
         let audio_head = vb
             .get(
@@ -436,7 +565,7 @@ impl QuantizedCsmModel {
                     decoder_cfg.embed_dim,
                     cfg.audio_vocab_size,
                 ),
-                "audio_head",
+                &audio_head_tensor_name,
             )?
             .dequantize(vb.device())?;
 
