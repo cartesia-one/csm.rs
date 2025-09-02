@@ -33,6 +33,12 @@ async fn generate_audio_blocking(
 struct Args {
     #[arg(short, long, default_value = "Hi there, this is a test")]
     text: String,
+    #[arg(long, default_value_t = 0)]
+    speaker_id: u32,
+    #[arg(long, default_value_t = 0.7)]
+    temperature: f64,
+    #[arg(long, default_value_t = 100)]
+    top_k: usize,
     #[arg(short, long, default_value_t = 1)]
     warmup_runs: u32,
     #[arg(short, long, default_value_t = 5)]
@@ -43,6 +49,12 @@ struct Args {
     quantized: bool,
     #[arg(long)]
     quantized_weights: Option<PathBuf>,
+    #[arg(long)]
+    model_id: Option<String>,
+    #[arg(long)]
+    tokenizer_id: Option<String>,
+    #[arg(long)]
+    index_file: Option<String>,
 }
 
 #[tokio::main]
@@ -61,8 +73,9 @@ async fn main() -> Result<()> {
     let gen_args = GeneratorArgs {
         quantized: args.quantized,
         quantized_weights: args.quantized_weights.clone(),
-        model_id: None,
-        tokenizer_id: None,
+        model_id: args.model_id,
+        tokenizer_id: args.tokenizer_id,
+        index_file: args.index_file,
         device: device.clone(),
     };
     let mut generator = Generator::new(gen_args).await?;
@@ -75,7 +88,14 @@ async fn main() -> Result<()> {
 
     log::info!("Starting {} warm-up runs...", args.warmup_runs);
     for i in 0..args.warmup_runs {
-        let _ = generate_audio_blocking(&mut generator, &args.text, 0, 0.7, 100).await?;
+        let _ = generate_audio_blocking(
+            &mut generator,
+            &args.text,
+            args.speaker_id,
+            args.temperature,
+            args.top_k,
+        )
+        .await?;
         log::info!("Warm-up run {}/{} complete.", i + 1, args.warmup_runs);
     }
 
@@ -85,8 +105,14 @@ async fn main() -> Result<()> {
 
     for i in 0..args.num_runs {
         let start_time = Instant::now();
-        let audio_tensor =
-            generate_audio_blocking(&mut generator, &args.text, 0, 0.7, 100).await?;
+        let audio_tensor = generate_audio_blocking(
+            &mut generator,
+            &args.text,
+            args.speaker_id,
+            args.temperature,
+            args.top_k,
+        )
+        .await?;
         let elapsed = start_time.elapsed();
 
         let audio_len_s = audio_tensor.dim(0)? as f64 / sample_rate;
