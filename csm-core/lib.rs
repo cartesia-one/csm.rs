@@ -187,7 +187,7 @@ impl Generator {
         top_k: usize,
         buffer_size: usize,
         tokenizer_template: Option<String>,
-    ) -> Pin<Box<dyn Stream<Item = Result<Tensor>> + 'a>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<Tensor>> + Send + 'a>> {
         use async_stream::stream;
 
         let stream = stream! {
