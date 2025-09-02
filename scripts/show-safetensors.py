@@ -3,7 +3,7 @@ import sys
 import json
 from pathlib import Path
 
-from huggingface_hub import snapshot_download, HfFolder
+from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
 def main():
@@ -20,6 +20,11 @@ def main():
         "--model-path", 
         type=Path, 
         help="Path to a local model directory or a specific safetensors file within it."
+    )
+    parser.add_argument(
+        "--index-file",
+        type=str,
+        default="model.safetensors.index.json"
     )
     args = parser.parse_args()
 
@@ -45,7 +50,7 @@ def main():
             model_directory = input_path.parent
 
     safetensors_files = []
-    index_path = model_directory / "model.safetensors.index.json"
+    index_path = model_directory / args.index_file
 
     if index_path.exists():
         print(f"Found index file: {index_path}")
