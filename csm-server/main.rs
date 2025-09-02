@@ -60,12 +60,7 @@ struct SpeechRequest {
     max_audio_len_ms: f32,
     #[serde(default = "default_buffer_size")]
     buffer_size: usize,
-    tokenizer_template: Option<String>,
-
-    model: Option<String>,
-    voice: Option<String>,
-    instructions: Option<String>,
-    response_format: Option<String>,
+    tokenizer_template: Option<String>
 }
 
 fn default_temperature() -> f64 { 0.7 }
