@@ -1,13 +1,28 @@
 import argparse
 import struct
 from pathlib import Path
+import sys
+import json
 import numpy as np
 import torch
-from safetensors.torch import load_file
+from safetensors import safe_open
+from huggingface_hub import snapshot_download
+from tqdm import tqdm
+
 
 GGUF_MAGIC = 0x46554747
 GGUF_VERSION = 3
 GGUF_DEFAULT_ALIGNMENT = 32
+
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 class GGUFValueType:
     UINT8 = 0
@@ -84,7 +99,7 @@ class GGUFWriter:
                 raise NotImplementedError(f"Value type {value_type} not implemented")
 
     def write_tensor_info(self):
-         for tensor in self.tensors:
+        for tensor in self.tensors:
             self.write_string(tensor["name"])
             shape = tensor["shape"]
             self.write_u32(len(shape))
@@ -104,6 +119,77 @@ class GGUFWriter:
 
     def close(self):
         self.f.close()
+
+def load_model_weights(identifier: str, model_name: str, index_file: str) -> dict:
+    print(f"{Colors.HEADER}--- Loading {model_name}: '{identifier}' ---{Colors.ENDC}")
+    model_directory = None
+    safetensors_files = []
+
+    as_path = Path(identifier)
+    if as_path.exists() and as_path.is_dir():
+        model_directory = as_path
+        print(f"Identifier is a local directory: {model_directory}")
+    elif as_path.exists() and as_path.is_file():
+        print(f"Identifier is a local file: {as_path}")
+        safetensors_files = [as_path]
+        model_directory = as_path.parent
+    else:
+        print(f"Identifier is not a local path. Assuming it's a Hugging Face model ID and attempting download...")
+        try:
+            model_directory = Path(snapshot_download(repo_id=identifier))
+            print(f"Model successfully located at: {model_directory}")
+        except Exception as e:
+            print(f"{Colors.FAIL}Error: Could not download model '{identifier}'.\nDetails: {e}{Colors.ENDC}", file=sys.stderr)
+            sys.exit(1)
+
+    if not safetensors_files:
+        index_path = model_directory / index_file
+        if index_path.exists():
+            print(f"Found index file, loading sharded model: {index_path.name}")
+            try:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    index_data = json.load(f)
+                weight_map = index_data.get("weight_map")
+                if not weight_map:
+                    print(f"{Colors.FAIL}Error: 'weight_map' not found in {index_path}{Colors.ENDC}", file=sys.stderr)
+                    sys.exit(1)
+
+                unique_files = sorted(list(set(weight_map.values())))
+                for filename in unique_files:
+                    file_path = model_directory / filename
+                    if not file_path.exists():
+                        print(f"{Colors.FAIL}Error: Shard file specified in index not found: {file_path}{Colors.ENDC}", file=sys.stderr)
+                        sys.exit(1)
+                    safetensors_files.append(file_path)
+            except Exception as e:
+                print(f"{Colors.FAIL}Error processing index file {index_path}: {e}{Colors.ENDC}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(f"Could not find index file. Looking for single safetensors file...")
+            possible_files = list(model_directory.glob("*.safetensors"))
+            if len(possible_files) == 1:
+                safetensors_files.append(possible_files[0])
+            elif len(possible_files) > 1:
+                print(f"{Colors.FAIL}Error: Found multiple .safetensors files but no index. Cannot determine which to load: {possible_files}{Colors.ENDC}", file=sys.stderr)
+                sys.exit(1)
+
+    if not safetensors_files:
+        print(f"{Colors.FAIL}Error: No safetensors files were found for '{identifier}'.{Colors.ENDC}", file=sys.stderr)
+        sys.exit(1)
+
+    model_tensors = {}
+    print(f"Loading tensors from: {[str(p.name) for p in safetensors_files]}")
+    for model_file in safetensors_files:
+        try:
+            with safe_open(model_file, framework="pt", device="cpu") as f:
+                for key in tqdm(f.keys(), desc=f"  > Loading {model_file.name}"):
+                    model_tensors[key] = f.get_tensor(key)
+        except Exception as e:
+            print(f"{Colors.FAIL}Error loading {model_file}: {e}{Colors.ENDC}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"{Colors.HEADER}--- Finished loading {model_name}. Found {len(model_tensors)} tensors. ---\n{Colors.ENDC}")
+    return model_tensors
 
 def quantize_q8_0(tensor: torch.Tensor) -> np.ndarray:
     if tensor.ndim != 2:
@@ -197,14 +283,17 @@ def quantize_q4_k(tensor: torch.Tensor) -> np.ndarray:
     return quantized_data.reshape(rows, n_blocks * 144)
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=Path, required=True, help="Path to model.safetensors")
-    parser.add_argument("--output-path", type=Path, required=True, help="Path to save quantized GGUF model")
-    parser.add_argument("--qtype", type=str, default="q8_0", choices=["q8_0", "q4_k"], help="Quantization type")
+    parser = argparse.ArgumentParser(description="Quantize a model to GGUF format.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--model-id", type=str, help="The Hugging Face model ID to quantize (e.g., 'sesame/csm-1b').")
+    group.add_argument("--model-path", type=Path, help="Path to a local model directory or a specific safetensors file.")
+    parser.add_argument("--index-file", type=str, default="model.safetensors.index.json", help="The name of the index file for sharded models.")
+    parser.add_argument("--output-path", type=Path, required=True, help="Path to save quantized GGUF model.")
+    parser.add_argument("--qtype", type=str, default="q8_0", choices=["q8_0", "q4_k"], help="Quantization type.")
     args = parser.parse_args()
 
-    print(f"Loading model from {args.model_path}")
-    model = load_file(args.model_path)
+    identifier = args.model_id if args.model_id else args.model_path
+    model = load_model_weights(str(identifier), "model", args.index_file)
 
     writer = GGUFWriter(args.output_path, "csm")
     
