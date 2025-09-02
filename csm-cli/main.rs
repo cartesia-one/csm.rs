@@ -24,6 +24,8 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     buffer_size: usize,
     #[arg(long, default_value_t = false)]
+    cpu: bool,
+    #[arg(long, default_value_t = false)]
     quantized: bool,
     #[arg(long)]
     quantized_weights: Option<PathBuf>,
@@ -41,7 +43,11 @@ async fn run() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
-    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
+    let device = if args.cpu {
+        Device::Cpu
+    } else {
+        Device::new_cuda(0).unwrap_or(Device::Cpu)
+    };
 
     log::info!("Initializing generator and loading models...");
     let start_load = std::time::Instant::now();
