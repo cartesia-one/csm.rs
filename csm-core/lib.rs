@@ -40,15 +40,7 @@ impl Generator {
     pub async fn new(args: GeneratorArgs) -> Result<Self> {
         let device = args.device;
         let csm_dtype = match &device {
-            Device::Cuda(_) => {
-                if device.supports_bf16() {
-                    log::info!("CUDA device supports bf16, using DType::BF16.");
-                    DType::BF16
-                } else {
-                    log::info!("CUDA device does not support bf16, using DType::F16.");
-                    DType::F16
-                }
-            }
+            Device::Cuda(_) => DType::F16,
             _ => DType::F32,
         };
         log::info!("Using device: {:?} for generation", device);
