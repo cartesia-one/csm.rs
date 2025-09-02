@@ -1,22 +1,22 @@
 # csm.rs
 
-`csm.rs` is a **high-performance rust implementation** of Sesame's [Conversational Speech Model (CSM)](https://huggingface.co/sesame/csm-1b), designed for **real-time streaming fast and efficient** text-to-speech (TTS) inference. It is built on the `candle` machine learning framework.
+`csm.rs` is a **high-performance Rust implementation** of Sesame's [Conversational Speech Model (CSM)](https://huggingface.co/sesame/csm-1b), designed for **fast, efficient, and real-time streaming** text-to-speech (TTS) inference. It is built on the `candle` machine learning framework.
 
 This implementation is simple, straightforward, and aims for raw performance.
 
 ## ✨ Features
 
-  - ⚡️ **Blazing Fast**: High-performance inference powered by **rust** and `candle`.
+  - ⚡️ **Blazing-Fast**: High-performance inference powered by **Rust** and `candle`.
   - 🤗 **Broad Model Support**: Natively supports both the **original** `sesame/csm-1b` weights and weights from **Hugging Face** `transformers`-compatible **fine-tunes**.
   - 🤏 **Quantization**: Supports **GGUF-based** `q8_0` and `q4_k` **quantization** for reduced memory footprint and faster inference on CPU.
   - ⚙️ **Multiple Backends**: Leverages `candle` to support **multiple hardware targets**, including MKL, Accelerate (macOS), CUDA, cuDNN, and Metal (Apple Silicon).
-  - 🔌 **OpenAI Compatible**: Includes a **OpenAI compatible API web server** for seamless integration with existing tools.
+  - 🔌 **OpenAI Compatible**: Includes an **OpenAI-compatible API web server** for seamless integration with existing tools.
 
 ## 🚀 Getting Started
 
 ### Compilation
 
-To build the project, select the appropriate feature flag for your target hardware. The main binaries are `main`, `benchmark`, and `server`.
+To build the project, select the appropriate feature flag for your target hardware. The project provides three main binaries: `main` (for command-line interface usage), `benchmark` (for throughput measurement), and `server` (for the OpenAI-compatible API).
 
 **CPU (MKL - Linux/Windows)**
 For optimal performance on Intel CPUs.
@@ -71,7 +71,7 @@ The CLI allows you to generate audio directly from your terminal. Models are dow
 ```
 
 **Generate audio with a quantized model:**
-First, you'll need a quantized model file. See the [Quantization](https://www.google.com/search?q=%23-quantization) section for instructions on how to create one.
+First, you'll need a quantized model file. See the [Quantization](#-quantization) section for instructions on how to create one.
 
 ```bash
 ./target/release/main \
@@ -123,11 +123,22 @@ response = client.audio.speech.create(
     }
 )
 
-# Stream the output to a file
+# Save the output to a file
 speech_file_path = Path("server_output.wav")
 response.stream_to_file(speech_file_path)
 
-print(f"Audio saved to {speech_file_path}")
+# Or use the streaming endpoint
+with client.audio.speech.with_streaming_response.create(
+    model="csm-1b",
+    voice="alloy",
+    input="Hello from the streaming endpoint",
+    response_format="wav",
+    extra_body=dict(
+        speaker_id=0,
+    )
+) as response:
+    for chunk in response.iter_bytes(chunk_size=1024):
+        print(chunk)
 
 ```
 
@@ -182,7 +193,7 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release --features mkl --bin benchm
 
 ## 📜 License
 
-This project is licensed under the **GNU Affero General Public License Version 3** license the `LICENSE` file for details.
+This project is licensed under the **GNU Affero General Public License Version 3**. See the `LICENSE` file for details.
 
 ## 🤝 Contributing
 
