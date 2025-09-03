@@ -71,14 +71,16 @@ The CLI allows you to generate audio directly from your terminal. Models are dow
 ```
 
 **Generate audio with a quantized model:**
-First, you'll need a quantized model file. See the [Quantization](#-quantization) section for instructions on how to create one.
 
 ```bash
 ./target/release/main \
     --text "Hello there from the quantized model" \
-    --weights-path "./csm-1b-q8_0.gguf" \
+    --model-id cartesia/sesame-csm-1b-gguf \
+    --model-file q8.gguf \
     --output "output_q8.wav"
 ```
+
+To quantize your own models see the [Quantization](#-quantization) section.
 
 ### OpenAI-Compatible Server
 
@@ -95,7 +97,8 @@ First, you'll need a quantized model file. See the [Quantization](#-quantization
 ```bash
 ./target/release/server \
     --port 8080 \
-    --weights-path "./csm-1b-q8_0.gguf"
+    --model-id cartesia/sesame-csm-1b-gguf \
+    --model-file q8.gguf
 ```
 
 **Python Client Example**
