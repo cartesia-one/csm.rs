@@ -76,8 +76,7 @@ First, you'll need a quantized model file. See the [Quantization](#-quantization
 ```bash
 ./target/release/main \
     --text "Hello there from the quantized model" \
-    --quantized \
-    --quantized-weights "./csm-1b-q8_0.gguf" \
+    --weights-path "./csm-1b-q8_0.gguf" \
     --output "output_q8.wav"
 ```
 
@@ -96,8 +95,7 @@ First, you'll need a quantized model file. See the [Quantization](#-quantization
 ```bash
 ./target/release/server \
     --port 8080 \
-    --quantized \
-    --quantized-weights "./csm-1b-q8_0.gguf"
+    --weights-path "./csm-1b-q8_0.gguf"
 ```
 
 **Python Client Example**
@@ -141,6 +139,57 @@ with client.audio.speech.with_streaming_response.create(
         print(chunk)
 
 ```
+
+### Command-Line Arguments
+
+All binaries share a common set of arguments for model loading and hardware selection.
+
+#### Common Arguments (for `main`, `benchmark`, `server`)
+
+| Argument | Description | Default Value |
+| :--- | :--- | :--- |
+| `--weights-path` | Absolute path to a weight file (`.safetensors` or `.gguf`). Overrides all other model loading options. | `None` |
+| `--model-id` | The model ID from the Hugging Face Hub (e.g., `'sesame/csm-1b'`). | `None` |
+| `--model-path` | Path to a local directory containing the model files. | `None` |
+| `--model-file` | The name of a single model file to use within a `--model-id` or `--model-path`. | `None` |
+| `--index-file` | The name of the index file for sharded models. | `None` |
+| `--tokenizer-id` | The tokenizer ID from the Hugging Face Hub. Defaults to the `--model-id` if not set. | `None` |
+| `--cpu` | If set, forces the computation to run on the CPU. | `false` |
+
+#### Specific Arguments for `main` (CLI)
+
+| Argument | Description | Default Value |
+| :--- | :--- | :--- |
+| `--text` | The text to generate audio from. | `"Hello there, this is a test"` |
+| `--output` | The path to save the output `.wav` file. | `"csm_output.wav"` |
+| `--speaker-id` | The speaker ID to use for generation. | `0` |
+| `--temperature` | Sampling temperature. | `0.7` |
+| `--top-k` | The number of highest probability tokens to consider for sampling (Top-K). | `100` |
+| `--max-audio-len-ms`| The maximum length of the generated audio in milliseconds. | `30000.0` |
+| `--buffer-size` | The number of audio frames to buffer before decoding to audio. | `20` |
+| `--tokenizer-template`| A custom tokenizer template. E.g., `"<\|begin_of_text\|>[{speaker_id}]{text}<\|end_of_text\|>"`. | `None` |
+
+#### Specific Arguments for `benchmark`
+
+| Argument | Short | Description | Default Value |
+| :--- | :---: | :--- | :--- |
+| `--text` | `-t` | The text to use for benchmarking. | `"Hi there, this is a test"` |
+| `--warmup-runs`| `-w` | The number of warm-up runs to perform before timing. | `1` |
+| `--num-runs` | `-n` | The number of timed runs to perform for the benchmark. | `5` |
+| `--speaker-id` | | The speaker ID to use for generation. | `0` |
+| `--temperature` | | Sampling temperature. | `0.7` |
+| `--top-k` | | The number of highest probability tokens to consider for sampling (Top-K). | `100` |
+| `--buffer-size` | | The number of audio frames to buffer before decoding to audio. | `20` |
+| `--tokenizer-template`| | A custom tokenizer template. E.g., `"<\|begin_of_text\|>[{speaker_id}]{text}<\|end_of_text\|>"`. | `None` |
+
+#### Specific Arguments for `server`
+
+| Argument | Description | Default Value |
+| :--- | :--- | :--- |
+| `--host` | The host address to bind the server to. | `"0.0.0.0"` |
+| `--port` | The port to run the server on. | `8080` |
+| `--api-key` | If set, requires clients to provide this key in the `Authorization: Bearer <key>` header. | `None` |
+
 
 ## 🤏 Quantization
 
@@ -188,7 +237,7 @@ You can run the built-in benchmark tool to measure the performance on your hardw
 cargo run --release --features cuda --bin benchmark
 
 # For a quantized model on CPU
-RUSTFLAGS="-C target-cpu=native" cargo run --release --features mkl --bin benchmark -- --quantized --quantized-weights ./csm-1b-q8_0.gguf
+RUSTFLAGS="-C target-cpu=native" cargo run --release --features mkl --bin benchmark -- --weights-path ./csm-1b-q8_0.gguf
 ```
 
 ## 📜 License
