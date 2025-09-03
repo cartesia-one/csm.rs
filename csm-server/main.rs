@@ -27,17 +27,20 @@ struct AppState {
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(long, default_value_t = false)]
-    quantized: bool,
-    #[arg(long)]
-    quantized_weights: Option<PathBuf>,
-    #[arg(long)]
-    model_id: Option<String>,
-    #[arg(long)]
-    tokenizer_id: Option<String>,
-    #[arg(long)]
-    index_file: Option<String>,
-    #[arg(long, default_value_t = false)]
     cpu: bool,
+
+    #[arg(long, help = "Absolute path to a weight file (.safetensors or .gguf). Overrides all other model loading options.")]
+    weights_path: Option<PathBuf>,
+    #[arg(long, help = "The model ID from the Hugging Face Hub (e.g., 'sesame/csm-1b').")]
+    model_id: Option<String>,
+    #[arg(long, help = "Path to a local directory containing the model files.")]
+    model_path: Option<PathBuf>,
+    #[arg(long, help = "The name of a single model file to use within a --model-id or --model-path.")]
+    model_file: Option<String>,
+    #[arg(long, help = "The name of the index file for sharded models.")]
+    index_file: Option<String>,
+    #[arg(long, help = "The tokenizer ID from the Hugging Face Hub. Defaults to the --model-id if not set.")]
+    tokenizer_id: Option<String>,
 
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
@@ -87,11 +90,12 @@ async fn main() -> Result<()> {
 
     log::info!("Loading model...");
     let gen_args = GeneratorArgs {
-        quantized: args.quantized,
-        quantized_weights: args.quantized_weights.clone(),
-        model_id: args.model_id.clone(),
-        tokenizer_id: args.tokenizer_id.clone(),
-        index_file: args.index_file.clone(),
+        weights_path: args.weights_path,
+        model_id: args.model_id,
+        model_path: args.model_path,
+        model_file: args.model_file,
+        index_file: args.index_file,
+        tokenizer_id: args.tokenizer_id,
         device,
     };
 

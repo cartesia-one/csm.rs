@@ -25,18 +25,21 @@ struct Args {
     buffer_size: usize,
     #[arg(long, default_value_t = false)]
     cpu: bool,
-    #[arg(long, default_value_t = false)]
-    quantized: bool,
-    #[arg(long)]
-    quantized_weights: Option<PathBuf>,
-    #[arg(long)]
+
+    #[arg(long, help = "Absolute path to a weight file (.safetensors or .gguf). Overrides all other model loading options.")]
+    weights_path: Option<PathBuf>,
+    #[arg(long, help = "The model ID from the Hugging Face Hub (e.g., 'sesame/csm-1b').")]
     model_id: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Path to a local directory containing the model files.")]
+    model_path: Option<PathBuf>,
+    #[arg(long, help = "The name of a single model file to use within a --model-id or --model-path.")]
+    model_file: Option<String>,
+    #[arg(long, help = "The name of the index file for sharded models.")]
+    index_file: Option<String>,
+    #[arg(long, help = "The tokenizer ID from the Hugging Face Hub. Defaults to the --model-id if not set.")]
     tokenizer_id: Option<String>,
     #[arg(long)]
     tokenizer_template: Option<String>,
-    #[arg(long, default_value = "model.safetensors.index.json")]
-    index_file: Option<String>,
 }
 
 async fn run() -> Result<()> {
@@ -52,11 +55,12 @@ async fn run() -> Result<()> {
     log::info!("Initializing generator and loading models...");
     let start_load = std::time::Instant::now();
     let gen_args = GeneratorArgs {
-        quantized: args.quantized,
-        quantized_weights: args.quantized_weights.clone(),
+        weights_path: args.weights_path,
         model_id: args.model_id,
-        tokenizer_id: args.tokenizer_id,
+        model_path: args.model_path,
+        model_file: args.model_file,
         index_file: args.index_file,
+        tokenizer_id: args.tokenizer_id,
         device,
     };
 
