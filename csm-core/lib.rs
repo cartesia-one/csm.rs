@@ -9,7 +9,7 @@ use rand::Rng;
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::pin::Pin;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
 mod csm_full_impl;
@@ -27,31 +27,34 @@ pub struct Generator {
     max_seq_len: usize,
 }
 
+#[derive(Clone, Debug)]
 pub struct GeneratorArgs {
-    pub quantized: bool,
-    pub quantized_weights: Option<PathBuf>,
+    pub weights_path: Option<PathBuf>,
     pub model_id: Option<String>,
-    pub tokenizer_id: Option<String>,
+    pub model_path: Option<PathBuf>,
+    pub model_file: Option<String>,
     pub index_file: Option<String>,
+    pub tokenizer_id: Option<String>,
     pub device: Device,
+}
+
+enum ModelSource {
+    Quantized(PathBuf),
+    Full(Vec<PathBuf>),
 }
 
 impl Generator {
     pub async fn new(args: GeneratorArgs) -> Result<Self> {
-        let device = args.device;
-        let csm_dtype = match &device {
-            Device::Cuda(_) => DType::F16,
-            _ => DType::F32,
-        };
-        log::info!("Using device: {:?} for generation", device);
-
         let api = Api::new()?;
 
-        log::info!("Loading text tokenizer...");
         let tokenizer_id = args
             .tokenizer_id
+            .clone()
+            .or_else(|| args.model_id.clone())
             .unwrap_or_else(|| "unsloth/Llama-3.2-1B".to_string());
-        let tokenizer_repo = api.repo(Repo::new(tokenizer_id, RepoType::Model));
+
+        log::info!("Loading text tokenizer from '{}'...", tokenizer_id);
+        let tokenizer_repo = api.repo(Repo::new(tokenizer_id.clone(), RepoType::Model));
         let tokenizer_path = tokenizer_repo.get("tokenizer.json").await?;
         let text_tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow!(e))?;
 
@@ -63,60 +66,46 @@ impl Generator {
             audio_num_codebooks: 32,
         };
 
-        log::info!("Loading CSM model...");
+        log::info!("Resolving CSM model weights...");
         let start_model_load = std::time::Instant::now();
-        let mut model = if args.quantized {
-            let qw_path = args.quantized_weights.ok_or_else(|| {
-                anyhow!("--quantized-weights must be specified for quantized model")
-            })?;
-            log::info!("Loading QUANTIZED model from {:?}", qw_path);
-            CsmModelWrapper::new_quantized(&config, &qw_path, &device)?
-        } else {
-            log::info!("Loading FULL PRECISION model with dtype {:?}", csm_dtype);
-            let model_id = args.model_id.unwrap_or_else(|| "sesame/csm-1b".to_string());
-            let model_repo = api.repo(Repo::new(model_id, RepoType::Model));
 
-            let mut safetensors_paths: Vec<PathBuf> = Vec::new();
-            let index_file: String = args.index_file.clone().unwrap_or_else(|| "model.safetensors.index.json".to_string());
-            match model_repo.get(&index_file).await {
-                Ok(index_path) => {
-                    log::info!("Found {:?}, loading sharded weights.", args.index_file);
-                    let index_content = fs::read_to_string(&index_path)?;
-                    let json: serde_json::Value = serde_json::from_str(&index_content)?;
-                    let weight_map = json["weight_map"]
-                        .as_object()
-                        .ok_or_else(|| anyhow!("Invalid 'weight_map' in index.json"))?;
-                    let unique_files: HashSet<&str> =
-                        weight_map.values().filter_map(|v| v.as_str()).collect();
-                    for filename in unique_files {
-                        let safetensor_file = model_repo.get(filename).await?;
-                        safetensors_paths.push(safetensor_file);
-                    }
-                }
-                Err(_) => {
-                    log::info!("Could not find index file '{:?}'. Assuming single-file model and trying 'model.safetensors'.", args.index_file);
-                    let model_path = model_repo.get("model.safetensors").await?;
-                    safetensors_paths.push(model_path);
-                }
-            }
-
-            log::info!("Loading weights from: {:?}", safetensors_paths);
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&safetensors_paths, csm_dtype, &device)?
-            };
-
-            let flavor = {
-                if vb.contains_tensor("embed_text_tokens.weight"){
-                    log::info!("Detected 'Transformers' weight naming convention.");
-                    WeightMapFlavor::Transformers
-                } else {
-                    log::info!("Assuming 'Sesame' weight naming convention.");
-                    WeightMapFlavor::Sesame
-                }
-            };
-
-            CsmModelWrapper::new_full(&config, vb, flavor)?
+        let model_source = Self::resolve_model_source(&args, &api).await?;
+        
+        let device = args.device;
+        let csm_dtype = match &device {
+            Device::Cuda(_) => DType::F16,
+            _ => DType::F32,
         };
+        log::info!("Using device: {:?} for generation", device);
+
+        let mut model = match model_source {
+            ModelSource::Quantized(qw_path) => {
+                log::info!("Loading QUANTIZED model from {:?}", qw_path);
+                CsmModelWrapper::new_quantized(&config, &qw_path, &device)?
+            }
+            ModelSource::Full(safetensors_paths) => {
+                log::info!(
+                    "Loading FULL PRECISION model with dtype {:?} from {:?}",
+                    csm_dtype,
+                    safetensors_paths
+                );
+                let vb = unsafe {
+                    VarBuilder::from_mmaped_safetensors(&safetensors_paths, csm_dtype, &device)?
+                };
+
+                let flavor = {
+                    if vb.contains_tensor("embed_text_tokens.weight") {
+                        log::info!("Detected 'Transformers' weight naming convention.");
+                        WeightMapFlavor::Transformers
+                    } else {
+                        log::info!("Assuming 'Sesame' weight naming convention.");
+                        WeightMapFlavor::Sesame
+                    }
+                };
+                CsmModelWrapper::new_full(&config, vb, flavor)?
+            }
+        };
+
         log::info!(
             "Loaded CSM model in {:.2}s.",
             start_model_load.elapsed().as_secs_f64()
@@ -162,6 +151,92 @@ impl Generator {
         })
     }
 
+    async fn resolve_model_source(args: &GeneratorArgs, api: &Api) -> Result<ModelSource> {
+        if let Some(weights_path) = &args.weights_path {
+            log::info!("Using --weights-path with highest priority: {:?}", weights_path);
+            if !weights_path.exists() {
+                return Err(anyhow!("File not found: {:?}", weights_path));
+            }
+            return Self::source_from_path(weights_path);
+        }
+
+        if let Some(model_path) = &args.model_path {
+            log::info!("Using local model path: {:?}", model_path);
+            
+            if let Some(model_file) = &args.model_file {
+                let file_path = model_path.join(model_file);
+                log::info!("Looking for specified --model-file: {:?}", file_path);
+                if !file_path.exists() {
+                    return Err(anyhow!("Specified --model-file not found: {:?}", file_path));
+                }
+                return Self::source_from_path(&file_path);
+            }
+            
+            let index_file_name = args.index_file.clone().unwrap_or_else(|| "model.safetensors.index.json".to_string());
+            let index_path = model_path.join(index_file_name);
+            if index_path.exists() {
+                log::info!("Found index file, loading sharded weights from: {:?}", index_path);
+                let parent_dir = index_path.parent().ok_or_else(|| anyhow!("Could not get parent directory of index file"))?;
+                let index_content = fs::read_to_string(&index_path)?;
+                let json: serde_json::Value = serde_json::from_str(&index_content)?;
+                let weight_map = json["weight_map"].as_object().ok_or_else(|| anyhow!("Invalid 'weight_map' in index.json"))?;
+                let unique_files: HashSet<&str> = weight_map.values().filter_map(|v| v.as_str()).collect();
+                let safetensors_paths = unique_files.into_iter().map(|f| parent_dir.join(f)).collect();
+                return Ok(ModelSource::Full(safetensors_paths));
+            }
+
+            let single_model_path = model_path.join("model.safetensors");
+            if single_model_path.exists() {
+                log::info!("No index file found. Falling back to single file: {:?}", single_model_path);
+                return Self::source_from_path(&single_model_path);
+            }
+        }
+        else {
+            let model_id = args.model_id.clone().unwrap_or_else(|| "sesame/csm-1b".to_string());
+             if args.model_id.is_none() {
+                log::info!("No model source specified, falling back to default: {}", model_id);
+            } else {
+                log::info!("Fetching model from Hugging Face Hub: {}", model_id);
+            }
+            let repo = api.repo(Repo::new(model_id, RepoType::Model));
+            
+            if let Some(model_file) = &args.model_file {
+                log::info!("Looking for specified --model-file: {}", model_file);
+                let file_path = repo.get(model_file).await?;
+                return Self::source_from_path(&file_path);
+            }
+            
+            let index_file_name = args.index_file.clone().unwrap_or_else(|| "model.safetensors.index.json".to_string());
+            if let Ok(index_path) = repo.get(&index_file_name).await {
+                log::info!("Found index file, loading sharded weights from Hub.");
+                let index_content = fs::read_to_string(&index_path)?;
+                let json: serde_json::Value = serde_json::from_str(&index_content)?;
+                let weight_map = json["weight_map"].as_object().ok_or_else(|| anyhow!("Invalid 'weight_map' in index.json"))?;
+                let unique_files: HashSet<&str> = weight_map.values().filter_map(|v| v.as_str()).collect();
+                let mut safetensors_paths = Vec::new();
+                for filename in unique_files {
+                    safetensors_paths.push(repo.get(filename).await?);
+                }
+                return Ok(ModelSource::Full(safetensors_paths));
+            }
+            
+            if let Ok(single_model_path) = repo.get("model.safetensors").await {
+                log::info!("No index file found on Hub. Falling back to 'model.safetensors'.");
+                return Self::source_from_path(&single_model_path);
+            }
+        }
+
+        Err(anyhow!("Could not find a valid model. Please specify a valid --weights-path, --model-path, or --model-id."))
+    }
+
+    fn source_from_path(path: &Path) -> Result<ModelSource> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("gguf") => Ok(ModelSource::Quantized(path.to_path_buf())),
+            Some("safetensors") => Ok(ModelSource::Full(vec![path.to_path_buf()])),
+            _ => Err(anyhow!("Unsupported file extension for {:?}. Must be .gguf or .safetensors", path)),
+        }
+    }
+
     fn tokenize_text(&self, text: &str, speaker_id: u32, template: Option<&str>) -> Result<(Tensor, Tensor)> {
         let formatted_text = if let Some(template) = template {
             template
@@ -177,6 +252,7 @@ impl Generator {
         let ids: &[u32] = text_tokens_encoded.get_ids();
         Ok(self.model.text_tokens_and_mask(ids)?)
     }
+
     pub fn generate_stream<'a>(
         &'a mut self,
         text: &'a str,
