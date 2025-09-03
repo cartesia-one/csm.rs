@@ -201,7 +201,7 @@ async fn speech_handler(
 
 
 fn convert_tensor_to_bytes(tensor: candle_core::Tensor) -> Result<Bytes> {
-    let audio_f32 = tensor.to_vec1::<f32>()?;
+    let audio_f32 = tensor.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
     let audio_i16: Vec<i16> = audio_f32
         .iter()
         .map(|&sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)

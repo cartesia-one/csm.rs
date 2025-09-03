@@ -100,7 +100,7 @@ async fn run() -> Result<()> {
     };
 
     if final_audio.dim(0)? > 0 {
-        let audio_f32 = final_audio.to_vec1::<f32>()?;
+        let audio_f32 = final_audio.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         let audio_i16: Vec<i16> = audio_f32
             .iter()
             .map(|&sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
