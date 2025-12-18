@@ -1,0 +1,48 @@
+# Target directory (build artifacts)
+target/
+**/target/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+!README.md
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# Scripts
+scripts/
+
+# Test files
+test.py
+*.log
+
+# Models
+models/
+*.safetensors
+*.gguf
+
+# OS
+.DS_Store
+Thumbs.db

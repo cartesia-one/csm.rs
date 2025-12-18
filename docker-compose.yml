@@ -1,0 +1,68 @@
+services:
+  csm-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: csm-server:latest
+    container_name: csm-server
+    
+    # GPU configuration
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Port mapping
+    ports:
+      - "8002:8080"
+    
+    # Environment variables
+    environment:
+      - RUST_LOG=info
+      - HOST=0.0.0.0
+      - PORT=8080
+    
+    # Volume mounts for model caching
+    volumes:
+      - model-cache:/root/.cache/huggingface
+      - ./models:/models:ro  # Optional: local model directory
+    
+    # Command override - customize as needed
+    command:
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+      - --model-id
+      - "cartesia/azzurra-voice"
+      # Uncomment to use custom API key
+      # - --api-key
+      # - "your-secret-key"
+      # Uncomment to use local model
+      # - --model-path
+      # - /models/your-model
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  model-cache:
+    driver: local
