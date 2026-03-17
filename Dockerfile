@@ -31,7 +31,8 @@ COPY csm-server ./csm-server
 
 # Set CUDA compute capability (use 80 for A100, 86 for RTX 30xx, 89 for RTX 40xx, 90 for H100)
 # This skips nvidia-smi detection which isn't available at build time
-ENV CUDA_COMPUTE_CAP=89
+ARG CUDA_COMPUTE_CAP=90
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 
 # Build with CUDA support
 RUN cargo build --release --features cudnn
