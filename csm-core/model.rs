@@ -25,6 +25,9 @@ pub struct Config {
 pub trait Csm {
     fn clear_kv_cache(&mut self);
 
+    /// Pre-allocate KV cache buffers so the first forward pass is fast.
+    fn warm_kv_cache(&mut self) -> Result<()>;
+
     fn generate_frame(
         &mut self,
         tokens: &Tensor,
@@ -66,6 +69,13 @@ impl Csm for CsmModelWrapper {
         match self {
             CsmModelWrapper::Full(m) => m.clear_kv_cache(),
             CsmModelWrapper::Quantized(m) => m.clear_kv_cache(),
+        }
+    }
+
+    fn warm_kv_cache(&mut self) -> Result<()> {
+        match self {
+            CsmModelWrapper::Full(m) => m.warm_kv_cache(),
+            CsmModelWrapper::Quantized(m) => m.warm_kv_cache(),
         }
     }
 

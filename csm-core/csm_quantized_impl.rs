@@ -267,8 +267,8 @@ impl Attention {
         };
 
         // Use pre-allocated KV cache: write new K/V into the buffer via slice_set.
-        // slice_set requires contiguous tensors, so ensure that here.
-        let key_states = key_states.contiguous()?;
+        // key_states is already contiguous after RoPE.
+        // value_states needs .contiguous() since it was only transposed.
         let value_states = value_states.contiguous()?;
         self.ensure_kv_cache(key_states.dtype(), key_states.device())?;
         let (k_cache, v_cache) = self.kv_cache.as_mut().unwrap();
@@ -302,6 +302,11 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
+        // Keep the pre-allocated buffers; just reset the valid length.
+        self.kv_cache_len = 0;
+    }
+
+    fn free_kv_cache(&mut self) {
         self.kv_cache = None;
         self.kv_cache_len = 0;
     }
@@ -416,6 +421,10 @@ impl Layer {
     fn clear_kv_cache(&mut self) {
         self.attn.clear_kv_cache()
     }
+
+    fn free_kv_cache(&mut self) {
+        self.attn.free_kv_cache()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -462,6 +471,21 @@ impl LlamaModel {
             layer.clear_kv_cache()
         }
         self.cached_mask = None;
+    }
+
+    pub fn free_kv_cache(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.free_kv_cache()
+        }
+        self.cached_mask = None;
+    }
+
+    /// Pre-allocate KV cache buffers for all layers.
+    pub fn warm_kv_cache(&mut self) -> Result<()> {
+        for layer in self.layers.iter_mut() {
+            layer.attn.ensure_kv_cache(self.dtype, &self.device)?;
+        }
+        Ok(())
     }
 
     fn get_or_create_causal_mask(
@@ -626,6 +650,12 @@ impl Csm for QuantizedCsmModel {
         self.decoder.clear_kv_cache();
     }
 
+    fn warm_kv_cache(&mut self) -> Result<()> {
+        self.backbone.warm_kv_cache()?;
+        self.decoder.warm_kv_cache()?;
+        Ok(())
+    }
+
     fn generate_frame(
         &mut self,
         tokens: &Tensor,
@@ -667,17 +697,18 @@ impl Csm for QuantizedCsmModel {
         let h = self
             .backbone
             .forward(&embeds, input_pos, attention_mask.as_ref())?;
+        // h is already (1, 1, embed_dim) from backbone.forward which narrows to last token
 
-        let last_h = h.i((.., h.dim(1)? - 1, ..))?;
-        let c0_logits = self.codebook0_head.forward(&last_h)?;
-        let logits_for_sampling = c0_logits.i((0, ..))?.clone();
+        let c0_logits = self.codebook0_head.forward(&h)?;
+        let logits_for_sampling = c0_logits.i((0, 0, ..))?.clone();
         let c0_sample = lp.sample(&logits_for_sampling)?;
         let backbone_duration = backbone_start_time.elapsed();
 
         let mut all_samples = vec![c0_sample];
         let c0_sample_t = Tensor::from_slice(&[c0_sample], (1, 1), &self.decoder.device)?;
         let c0_embed = self.audio_embeddings.forward(&c0_sample_t)?;
-        let mut curr_h = Tensor::cat(&[last_h.unsqueeze(1)?, c0_embed], 1)?;
+        // h is (1, 1, 2048), c0_embed is (1, 1, 2048) — no unsqueeze needed
+        let mut curr_h = Tensor::cat(&[&h, &c0_embed], 1)?;
 
         self.decoder.clear_kv_cache();
         let mut decoder_pos = 0;

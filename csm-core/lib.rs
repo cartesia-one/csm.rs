@@ -36,6 +36,8 @@ pub struct GeneratorArgs {
     pub index_file: Option<String>,
     pub tokenizer_id: Option<String>,
     pub device: Device,
+    /// Override the dtype for model weights. If None, defaults to F16 on CUDA, F32 on CPU.
+    pub dtype: Option<DType>,
 }
 
 enum ModelSource {
@@ -72,10 +74,10 @@ impl Generator {
         let model_source = Self::resolve_model_source(&args, &api).await?;
         
         let device = args.device;
-        let csm_dtype = match &device {
+        let csm_dtype = args.dtype.unwrap_or(match &device {
             Device::Cuda(_) => DType::F16,
             _ => DType::F32,
-        };
+        });
         log::info!("Using device: {:?} for generation", device);
 
         let mut model = match model_source {
@@ -112,6 +114,7 @@ impl Generator {
         );
 
         model.clear_kv_cache();
+        model.warm_kv_cache()?;
 
         let mimi_dtype = match &model {
             CsmModelWrapper::Full(m) => m.backbone.dtype,
