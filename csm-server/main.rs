@@ -29,6 +29,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     cpu: bool,
 
+    #[arg(long, help = "Data type for model weights: f32, f16, bf16. Defaults to f16 on CUDA, f32 on CPU.")]
+    dtype: Option<String>,
+
     #[arg(long, help = "Absolute path to a weight file (.safetensors or .gguf). Overrides all other model loading options.")]
     weights_path: Option<PathBuf>,
     #[arg(long, help = "The model ID from the Hugging Face Hub (e.g., 'sesame/csm-1b').")]
@@ -77,6 +80,15 @@ struct ErrorResponse {
     error: String,
 }
 
+fn parse_dtype(s: &str) -> anyhow::Result<candle_core::DType> {
+    match s.to_lowercase().as_str() {
+        "f32" | "float32" => Ok(candle_core::DType::F32),
+        "f16" | "float16" => Ok(candle_core::DType::F16),
+        "bf16" | "bfloat16" => Ok(candle_core::DType::BF16),
+        _ => anyhow::bail!("Unsupported dtype '{}'. Use f32, f16, or bf16.", s),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -88,6 +100,8 @@ async fn main() -> Result<()> {
         candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu)
     };
 
+    let dtype = args.dtype.as_deref().map(parse_dtype).transpose()?;
+
     log::info!("Loading model...");
     let gen_args = GeneratorArgs {
         weights_path: args.weights_path,
@@ -97,6 +111,7 @@ async fn main() -> Result<()> {
         index_file: args.index_file,
         tokenizer_id: args.tokenizer_id,
         device,
+        dtype,
     };
 
     let generator = Generator::new(gen_args).await?;

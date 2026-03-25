@@ -63,7 +63,7 @@ struct Args {
     temperature: f64,
     #[arg(long, default_value_t = 100)]
     top_k: usize,
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 1)]
     buffer_size: usize,
     #[arg(short, long, default_value_t = 1)]
     warmup_runs: u32,
@@ -71,6 +71,9 @@ struct Args {
     num_runs: u32,
     #[arg(long, default_value_t = false)]
     cpu: bool,
+
+    #[arg(long, help = "Data type for model weights: f32, f16, bf16. Defaults to f16 on CUDA, f32 on CPU.")]
+    dtype: Option<String>,
 
     #[arg(long, help = "Absolute path to a weight file (.safetensors or .gguf). Overrides all other model loading options.")]
     weights_path: Option<PathBuf>,
@@ -88,6 +91,15 @@ struct Args {
     tokenizer_template: Option<String>,
 }
 
+fn parse_dtype(s: &str) -> Result<DType> {
+    match s.to_lowercase().as_str() {
+        "f32" | "float32" => Ok(DType::F32),
+        "f16" | "float16" => Ok(DType::F16),
+        "bf16" | "bfloat16" => Ok(DType::BF16),
+        _ => anyhow::bail!("Unsupported dtype '{}'. Use f32, f16, or bf16.", s),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -99,6 +111,8 @@ async fn main() -> Result<()> {
         Device::new_cuda(0).unwrap_or(Device::Cpu)
     };
 
+    let dtype = args.dtype.as_deref().map(parse_dtype).transpose()?;
+
     log::info!("--- RUNNING BENCHMARK ---");
     let start_load = std::time::Instant::now();
     let gen_args = GeneratorArgs {
@@ -109,6 +123,7 @@ async fn main() -> Result<()> {
         index_file: args.index_file,
         tokenizer_id: args.tokenizer_id,
         device: device.clone(),
+        dtype,
     };
     let mut generator = Generator::new(gen_args).await?;
     log::info!(
