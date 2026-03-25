@@ -288,7 +288,7 @@ impl Generator {
             let mut current_pos = 0;
 
             for i in 0..max_gen_len {
-                log::info!("generating frame {:?} (max: {:?})", i + 1, max_gen_len);
+                log::debug!("generating frame {:?} (max: {:?})", i + 1, max_gen_len);
                 let seq_len = current_tokens.dim(1)?;
                 if seq_len > self.max_seq_len {
                     let start_pos = seq_len - self.max_seq_len;

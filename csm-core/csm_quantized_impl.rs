@@ -1,6 +1,6 @@
 use crate::model::{Config, Csm, Flavor};
 use candle_core::quantized::QMatMul;
-use candle_core::{D, DType, Device, IndexOp, Module, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{Embedding, RmsNorm};
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::quantized_var_builder::VarBuilder as QVarBuilder;
@@ -145,10 +145,7 @@ impl QLinear {
 
         let bias_name = format!("{prefix}.bias");
         let bias = if vb.contains_key(&bias_name) {
-            Some(
-                vb.get_no_shape(&bias_name)?
-                    .dequantize(vb.device())?,
-            )
+            Some(vb.get_no_shape(&bias_name)?.dequantize(vb.device())?)
         } else {
             None
         };
@@ -172,10 +169,12 @@ struct Attention {
     o_proj: QLinear,
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache_len: usize,
     num_heads: usize,
     head_dim: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
+    max_seq_len: usize,
     flavor: WeightMapFlavor,
 }
 impl Attention {
@@ -203,12 +202,33 @@ impl Attention {
             o_proj,
             rotary_emb,
             kv_cache: None,
+            kv_cache_len: 0,
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
             num_kv_groups: cfg.num_heads / cfg.num_kv_heads,
             head_dim,
+            max_seq_len: cfg.max_seq_len,
             flavor,
         })
+    }
+
+    /// Pre-allocate the KV cache buffers to avoid repeated concatenation.
+    fn ensure_kv_cache(&mut self, dtype: DType, device: &Device) -> Result<()> {
+        if self.kv_cache.is_none() {
+            let k_cache = Tensor::zeros(
+                (1, self.num_kv_heads, self.max_seq_len, self.head_dim),
+                dtype,
+                device,
+            )?;
+            let v_cache = Tensor::zeros(
+                (1, self.num_kv_heads, self.max_seq_len, self.head_dim),
+                dtype,
+                device,
+            )?;
+            self.kv_cache = Some((k_cache, v_cache));
+            self.kv_cache_len = 0;
+        }
+        Ok(())
     }
 
     fn forward(
@@ -225,45 +245,41 @@ impl Attention {
 
         let query_states = query_states
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+            .transpose(1, 2)?;
         let key_states = key_states
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+            .transpose(1, 2)?;
         let value_states = value_states
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+            .transpose(1, 2)?;
 
         let (query_states, key_states) = match self.flavor {
             WeightMapFlavor::Sesame => self.rotary_emb.apply_rotary_emb_qkv_interleaved(
-                &query_states,
-                &key_states,
+                &query_states.contiguous()?,
+                &key_states.contiguous()?,
                 seqlen_offset,
             )?,
-            WeightMapFlavor::Transformers => self
-                .rotary_emb
-                .apply_rotary_emb_qkv_non_interleaved(
-                    &query_states,
-                    &key_states,
-                    seqlen_offset,
-                )?,
+            WeightMapFlavor::Transformers => self.rotary_emb.apply_rotary_emb_qkv_non_interleaved(
+                &query_states.contiguous()?,
+                &key_states.contiguous()?,
+                seqlen_offset,
+            )?,
         };
 
-        let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
-            }
-        };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        // Use pre-allocated KV cache: write new K/V into the buffer via slice_set
+        self.ensure_kv_cache(key_states.dtype(), key_states.device())?;
+        let (k_cache, v_cache) = self.kv_cache.as_mut().unwrap();
+        k_cache.slice_set(&key_states, 2, self.kv_cache_len)?;
+        v_cache.slice_set(&value_states, 2, self.kv_cache_len)?;
+        let total_len = self.kv_cache_len + q_len;
+        self.kv_cache_len = total_len;
+
+        // Narrow to the valid portion of the cache
+        let key_states = k_cache.narrow(2, 0, total_len)?;
+        let value_states = v_cache.narrow(2, 0, total_len)?;
 
         let key_states = candle_transformers::utils::repeat_kv(key_states, self.num_kv_groups)?;
-        let value_states =
-            candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?;
+        let value_states = candle_transformers::utils::repeat_kv(value_states, self.num_kv_groups)?;
 
         let attn_output = {
             let scale = 1f64 / f64::sqrt(self.head_dim as f64);
@@ -283,7 +299,8 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
+        self.kv_cache = None;
+        self.kv_cache_len = 0;
     }
 }
 #[derive(Debug, Clone)]
@@ -356,7 +373,9 @@ impl Layer {
     ) -> Result<Self> {
         let (sa_norm_name, mlp_norm_name, norm_tensor_name) = match flavor {
             WeightMapFlavor::Sesame => ("sa_norm", "mlp_norm", "scale"),
-            WeightMapFlavor::Transformers => ("input_layernorm", "post_attention_layernorm", "weight"),
+            WeightMapFlavor::Transformers => {
+                ("input_layernorm", "post_attention_layernorm", "weight")
+            }
         };
         let attn_name = match flavor {
             WeightMapFlavor::Sesame => "attn",
@@ -400,6 +419,8 @@ impl Layer {
 pub struct LlamaModel {
     layers: Vec<Layer>,
     norm: RmsNorm,
+    /// Pre-computed causal masks keyed by (tgt_len, seqlen_offset).
+    cached_mask: Option<(usize, usize, Tensor)>,
     pub device: Device,
     pub dtype: DType,
 }
@@ -413,9 +434,7 @@ impl LlamaModel {
         };
 
         let norm_vb = vb.pp("norm");
-        let norm_weight = norm_vb
-            .get_no_shape(norm_tensor_name)?
-            .dequantize(device)?;
+        let norm_weight = norm_vb.get_no_shape(norm_tensor_name)?.dequantize(device)?;
         let dtype = norm_weight.dtype();
         let norm = RmsNorm::new(norm_weight, cfg.norm_eps);
 
@@ -429,6 +448,7 @@ impl LlamaModel {
         Ok(Self {
             layers,
             norm,
+            cached_mask: None,
             device: device.clone(),
             dtype,
         })
@@ -438,13 +458,21 @@ impl LlamaModel {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+        self.cached_mask = None;
     }
 
-    fn prepare_decoder_attention_mask(
-        &self,
+    fn get_or_create_causal_mask(
+        &mut self,
         tgt_len: usize,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        // Return cached mask if shape matches
+        if let Some((cached_tgt, cached_offset, ref mask)) = self.cached_mask {
+            if cached_tgt == tgt_len && cached_offset == seqlen_offset {
+                return Ok(mask.clone());
+            }
+        }
+
         let mask: Vec<_> = (0..tgt_len)
             .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
             .collect();
@@ -455,8 +483,12 @@ impl LlamaModel {
         } else {
             mask
         };
-        mask.expand((1, 1, tgt_len, tgt_len + seqlen_offset))?
-            .to_dtype(self.dtype)
+        let mask = mask
+            .expand((1, 1, tgt_len, tgt_len + seqlen_offset))?
+            .to_dtype(self.dtype)?;
+
+        self.cached_mask = Some((tgt_len, seqlen_offset, mask.clone()));
+        Ok(mask)
     }
 
     pub fn forward(
@@ -483,6 +515,8 @@ pub struct QuantizedCsmModel {
     text_embeddings: Embedding,
     projection: QLinear,
     audio_head: Tensor,
+    /// Pre-computed codebook offset tensor: [0, audio_vocab_size, 2*audio_vocab_size, ...]
+    codebook_offsets: Tensor,
     pub config: Config,
 }
 
@@ -537,19 +571,13 @@ impl QuantizedCsmModel {
 
         let audio_embeddings_w = vb
             .get(
-                (
-                    cfg.audio_vocab_size * cfg.audio_num_codebooks,
-                    backbone_dim,
-                ),
+                (cfg.audio_vocab_size * cfg.audio_num_codebooks, backbone_dim),
                 audio_embed_name,
             )?
             .dequantize(vb.device())?;
 
         let text_embeddings_w = vb
-            .get(
-                (cfg.text_vocab_size, backbone_dim),
-                text_embed_name,
-            )?
+            .get((cfg.text_vocab_size, backbone_dim), text_embed_name)?
             .dequantize(vb.device())?;
 
         let audio_embeddings = Embedding::new(audio_embeddings_w, backbone_dim);
@@ -569,6 +597,12 @@ impl QuantizedCsmModel {
             )?
             .dequantize(vb.device())?;
 
+        // Pre-compute the codebook offset tensor once
+        let device = vb.device();
+        let codebook_offsets = (Tensor::arange(0u32, cfg.audio_num_codebooks as u32, device)?
+            * cfg.audio_vocab_size as f64)?
+            .reshape((1, 1, cfg.audio_num_codebooks))?;
+
         Ok(Self {
             backbone,
             decoder,
@@ -577,6 +611,7 @@ impl QuantizedCsmModel {
             text_embeddings,
             projection,
             audio_head,
+            codebook_offsets,
             config: cfg.clone(),
         })
     }
@@ -600,12 +635,8 @@ impl Csm for QuantizedCsmModel {
         let audio_tokens = tokens.narrow(D::Minus1, 0, self.config.audio_num_codebooks)?;
         let text_tokens = tokens.narrow(D::Minus1, self.config.audio_num_codebooks, 1)?;
         let text_embeds = self.text_embeddings.forward(&text_tokens)?;
-        let arange = (Tensor::arange(
-            0u32,
-            self.config.audio_num_codebooks as u32,
-            &self.decoder.device,
-        )? * self.config.audio_vocab_size as f64)?;
-        let audio_tokens = audio_tokens.broadcast_add(&arange.reshape((1, 1, ()))?)?;
+        // Use pre-computed codebook offsets instead of rebuilding every frame
+        let audio_tokens = audio_tokens.broadcast_add(&self.codebook_offsets)?;
         let audio_embeds = self.audio_embeddings.forward(&audio_tokens)?.reshape((
             b_sz,
             seq_len,
@@ -625,10 +656,10 @@ impl Csm for QuantizedCsmModel {
         let attention_mask = if seq_len <= 1 {
             None
         } else {
-            let mask = self
-                .backbone
-                .prepare_decoder_attention_mask(seq_len, input_pos)?;
-            Some(mask)
+            Some(
+                self.backbone
+                    .get_or_create_causal_mask(seq_len, input_pos)?,
+            )
         };
         let h = self
             .backbone
@@ -656,10 +687,10 @@ impl Csm for QuantizedCsmModel {
             let attention_mask = if curr_h.dim(1)? <= 1 {
                 None
             } else {
-                let mask = self
-                    .decoder
-                    .prepare_decoder_attention_mask(curr_h.dim(1)?, decoder_pos)?;
-                Some(mask)
+                Some(
+                    self.decoder
+                        .get_or_create_causal_mask(curr_h.dim(1)?, decoder_pos)?,
+                )
             };
             let decoder_forward_start = std::time::Instant::now();
             let decoder_h = self
@@ -683,7 +714,7 @@ impl Csm for QuantizedCsmModel {
         }
         let decoder_duration = decoder_start_time.elapsed();
         let total_frame_duration = frame_start_time.elapsed();
-        log::info!(
+        log::debug!(
             "Frame generation timings: Total {:.2}ms | Backbone: {:.2}ms | Decoder loop: {:.2}ms (incl. {:.2}ms for forward passes)",
             total_frame_duration.as_secs_f64() * 1000.0,
             backbone_duration.as_secs_f64() * 1000.0,
@@ -708,20 +739,23 @@ impl Csm for QuantizedCsmModel {
     fn text_tokens_and_mask(&self, ids: &[u32]) -> Result<(Tensor, Tensor)> {
         let cb = self.config.audio_num_codebooks;
         let device = &self.backbone.device;
-        let mut tokens = vec![];
-        let mut mask = vec![];
-        for &v in ids.iter() {
-            let mut token = vec![0; cb];
-            token.push(v);
-            let token = Tensor::from_vec(token, (1, 1, cb + 1), device)?;
-            tokens.push(token);
-            let mut m = vec![0u8; cb];
-            m.push(1);
-            let m = Tensor::from_vec(m, (1, 1, cb + 1), device)?;
-            mask.push(m);
+        let n = ids.len();
+
+        // Build flat token buffer: for each text token, cb zeros followed by the token id
+        let stride = cb + 1;
+        let mut flat_tokens = vec![0u32; n * stride];
+        for (idx, &v) in ids.iter().enumerate() {
+            flat_tokens[idx * stride + cb] = v;
         }
-        let tokens = Tensor::cat(&tokens, 1)?;
-        let mask = Tensor::cat(&mask, 1)?;
+        let tokens = Tensor::from_vec(flat_tokens, (1, n, stride), device)?;
+
+        // Build flat mask buffer: for each text token, cb zeros followed by 1
+        let mut flat_mask = vec![0u8; n * stride];
+        for idx in 0..n {
+            flat_mask[idx * stride + cb] = 1;
+        }
+        let mask = Tensor::from_vec(flat_mask, (1, n, stride), device)?;
+
         Ok((tokens, mask))
     }
 
