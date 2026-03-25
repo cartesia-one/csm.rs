@@ -5,6 +5,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
+    serve::ListenerExt,
     Json, Router,
     body::Body
 };
@@ -12,7 +13,6 @@ use bytes::Bytes;
 use clap::Parser;
 use csm_rs::{Generator, GeneratorArgs};
 use futures_util::StreamExt;
-use http_body_util::StreamBody;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{mpsc, Mutex};
@@ -132,7 +132,12 @@ async fn main() -> Result<()> {
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     log::info!("🚀 Starting server on http://{}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?
+        .tap_io(|tcp_stream| {
+            if let Err(err) = tcp_stream.set_nodelay(true) {
+                log::warn!("failed to set TCP_NODELAY on incoming connection: {err:#}");
+            }
+        });
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -176,22 +181,19 @@ async fn speech_handler(
         payload.buffer_size
     };
 
-    let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(16);
-
-    let sample_rate = {
-        let generator = state.generator.lock().await;
-        generator.audio_tokenizer.config().sample_rate as u32
-    };
-
-    let header = create_wav_header(sample_rate, 1, 16);
-    if tx.send(Ok(Bytes::from(header))).await.is_err() {
-        log::error!("Failed to send WAV header: client disconnected.");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Client disconnected").into_response();
-    }
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
 
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
         let mut generator = state_clone.generator.lock().await;
+
+        // Send WAV header first, while holding the lock
+        let sample_rate = generator.audio_tokenizer.config().sample_rate as u32;
+        let header = create_wav_header(sample_rate, 1, 16);
+        if tx.send(Ok(Bytes::from(header))).await.is_err() {
+            log::error!("Failed to send WAV header: client disconnected.");
+            return;
+        }
 
         let mut audio_stream = generator.generate_stream(
             &payload.input,
@@ -206,7 +208,7 @@ async fn speech_handler(
         while let Some(chunk_result) = audio_stream.next().await {
             let bytes_result = chunk_result
                 .and_then(convert_tensor_to_bytes)
-                .map_err(|e| axum::Error::new(e));
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
             if tx.send(bytes_result).await.is_err() {
                 log::info!("Client disconnected, stopping generation stream.");
@@ -215,12 +217,12 @@ async fn speech_handler(
         }
     });
 
-    let body = StreamBody::new(ReceiverStream::new(rx));
-    
+    let stream = ReceiverStream::new(rx);
+
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", "audio/wav".parse().unwrap());
 
-    (headers, Body::from_stream(body)).into_response()
+    (headers, Body::from_stream(stream)).into_response()
 }
 
 

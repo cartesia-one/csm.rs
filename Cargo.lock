@@ -715,7 +715,6 @@ dependencies = [
  "env_logger",
  "futures-util",
  "http",
- "http-body-util",
  "hyper",
  "log",
  "serde",
