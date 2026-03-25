@@ -10,6 +10,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::pin::Pin;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
 use tokenizers::Tokenizer;
 
 mod csm_full_impl;
@@ -347,6 +348,120 @@ impl Generator {
         };
 
         Box::pin(stream)
+    }
+
+    /// Synchronous generation that sends audio chunks through a std::sync::mpsc channel.
+    /// Designed to be called from a blocking thread (e.g. tokio::task::spawn_blocking)
+    /// to avoid starving the async runtime with GPU computation.
+    pub fn generate_to_channel(
+        &mut self,
+        text: &str,
+        speaker_id: u32,
+        max_audio_len_ms: f32,
+        temperature: f64,
+        top_k: usize,
+        buffer_size: usize,
+        tokenizer_template: Option<String>,
+        tx: std_mpsc::SyncSender<Result<Tensor>>,
+    ) {
+        let mut lp = LogitsProcessor::from_sampling(
+            rand::thread_rng().gen(),
+            candle_transformers::generation::Sampling::TopK { k: top_k, temperature },
+        );
+
+        self.model.clear_kv_cache();
+
+        let (prompt_tokens, prompt_mask) = match self.tokenize_text(text, speaker_id, tokenizer_template.as_deref()) {
+            Ok(t) => t,
+            Err(e) => { let _ = tx.send(Err(e)); return; }
+        };
+
+        let mut frame_buffer: VecDeque<Vec<u32>> = VecDeque::new();
+
+        let max_gen_len = (max_audio_len_ms / 80.0) as usize;
+        log::info!("Starting generation for up to {} frames...", max_gen_len);
+
+        let mut current_tokens = prompt_tokens;
+        let mut current_mask = prompt_mask;
+        let mut current_pos = 0;
+
+        for i in 0..max_gen_len {
+            log::debug!("generating frame {:?} (max: {:?})", i + 1, max_gen_len);
+            let seq_len = match current_tokens.dim(1) {
+                Ok(s) => s,
+                Err(e) => { let _ = tx.send(Err(e.into())); return; }
+            };
+            if seq_len > self.max_seq_len {
+                let start_pos = seq_len - self.max_seq_len;
+                current_tokens = match current_tokens.narrow(1, start_pos, self.max_seq_len) {
+                    Ok(t) => t,
+                    Err(e) => { let _ = tx.send(Err(e.into())); return; }
+                };
+                current_mask = match current_mask.narrow(1, start_pos, self.max_seq_len) {
+                    Ok(t) => t,
+                    Err(e) => { let _ = tx.send(Err(e.into())); return; }
+                };
+            }
+
+            let new_frame = match self.model.generate_frame(
+                &current_tokens,
+                &current_mask,
+                current_pos,
+                &mut lp,
+            ) {
+                Ok(t) => t,
+                Err(e) => { let _ = tx.send(Err(e.into())); return; }
+            };
+
+            if new_frame.iter().all(|&x| x == 0) {
+                log::info!("Model signaled end of generation at frame {}. Stopping.", i + 1);
+                break;
+            }
+
+            current_pos += match current_tokens.dim(1) {
+                Ok(s) => s,
+                Err(e) => { let _ = tx.send(Err(e.into())); return; }
+            };
+            let (next_tokens, next_mask) = match self.model.audio_tokens_and_mask(new_frame.clone()) {
+                Ok(t) => t,
+                Err(e) => { let _ = tx.send(Err(e.into())); return; }
+            };
+
+            current_tokens = next_tokens;
+            current_mask = next_mask;
+
+            frame_buffer.push_back(new_frame);
+
+            if frame_buffer.len() >= buffer_size {
+                let frames_to_decode: Vec<Vec<u32>> = frame_buffer.drain(..buffer_size).collect();
+                let audio_chunk = match self.decode_frames(frames_to_decode) {
+                    Ok(chunk) => chunk,
+                    Err(e) => { let _ = tx.send(Err(e)); return; }
+                };
+                let chunk = match audio_chunk.to_device(&Device::Cpu) {
+                    Ok(c) => c,
+                    Err(e) => { let _ = tx.send(Err(e.into())); return; }
+                };
+                if tx.send(Ok(chunk)).is_err() {
+                    log::info!("Client disconnected, stopping generation.");
+                    return;
+                }
+            }
+        }
+
+        if !frame_buffer.is_empty() {
+            let frames_to_decode: Vec<Vec<u32>> = frame_buffer.drain(..).collect();
+            let audio_chunk = match self.decode_frames(frames_to_decode) {
+                Ok(chunk) => chunk,
+                Err(e) => { let _ = tx.send(Err(e)); return; }
+            };
+            log::info!("Generated final audio chunk of size {:?}", audio_chunk.shape());
+            let chunk = match audio_chunk.to_device(&Device::Cpu) {
+                Ok(c) => c,
+                Err(e) => { let _ = tx.send(Err(e.into())); return; }
+            };
+            let _ = tx.send(Ok(chunk));
+        }
     }
 
     fn decode_frames(&mut self, frames: Vec<Vec<u32>>) -> Result<Tensor> {

@@ -12,14 +12,13 @@ use axum::{
 use bytes::Bytes;
 use clap::Parser;
 use csm_rs::{Generator, GeneratorArgs};
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 struct AppState {
-    generator: Mutex<Generator>,
+    generator: std::sync::Mutex<Generator>,
     api_key: Option<String>,
     default_buffer_size: usize,
 }
@@ -119,7 +118,7 @@ async fn main() -> Result<()> {
     let generator = Generator::new(gen_args).await?;
 
     let shared_state = Arc::new(AppState {
-        generator: Mutex::new(generator),
+        generator: std::sync::Mutex::new(generator),
         api_key: args.api_key.clone(),
         default_buffer_size: args.buffer_size,
     });
@@ -184,37 +183,59 @@ async fn speech_handler(
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
 
     let state_clone = Arc::clone(&state);
-    tokio::spawn(async move {
-        let mut generator = state_clone.generator.lock().await;
+    tokio::task::spawn_blocking(move || {
+        let mut generator = state_clone.generator.lock().unwrap();
 
-        // Send WAV header first, while holding the lock
+        // Send WAV header first
         let sample_rate = generator.audio_tokenizer.config().sample_rate as u32;
         let header = create_wav_header(sample_rate, 1, 16);
-        if tx.send(Ok(Bytes::from(header))).await.is_err() {
+        if tx.blocking_send(Ok(Bytes::from(header))).is_err() {
             log::error!("Failed to send WAV header: client disconnected.");
             return;
         }
 
-        let mut audio_stream = generator.generate_stream(
-            &payload.input,
-            payload.speaker_id,
-            payload.max_audio_len_ms,
-            payload.temperature,
-            payload.top_k,
+        // Use a std::sync::mpsc channel for the synchronous generation loop.
+        // generate_to_channel runs blocking GPU work and sends audio tensors
+        // through audio_tx as they're produced. We then forward them to the
+        // async tokio channel from a second thread so streaming works in real time.
+        let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<candle_core::Tensor>>(2);
+
+        let input = payload.input.clone();
+        let tokenizer_template = payload.tokenizer_template.clone();
+        let speaker_id = payload.speaker_id;
+        let max_audio_len_ms = payload.max_audio_len_ms;
+        let temperature = payload.temperature;
+        let top_k = payload.top_k;
+
+        // Forward audio chunks to the HTTP response stream in a separate thread,
+        // so that generate_to_channel (which blocks on GPU) can proceed in parallel
+        // with hyper flushing data to the client.
+        let forwarder = std::thread::spawn(move || {
+            for chunk_result in audio_rx {
+                let bytes_result = chunk_result
+                    .and_then(convert_tensor_to_bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+
+                if tx.blocking_send(bytes_result).is_err() {
+                    log::info!("Client disconnected, stopping generation stream.");
+                    break;
+                }
+            }
+        });
+
+        generator.generate_to_channel(
+            &input,
+            speaker_id,
+            max_audio_len_ms,
+            temperature,
+            top_k,
             buffer_size,
-            payload.tokenizer_template,
+            tokenizer_template,
+            audio_tx,
         );
 
-        while let Some(chunk_result) = audio_stream.next().await {
-            let bytes_result = chunk_result
-                .and_then(convert_tensor_to_bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-
-            if tx.send(bytes_result).await.is_err() {
-                log::info!("Client disconnected, stopping generation stream.");
-                break;
-            }
-        }
+        // Wait for forwarder to finish sending all chunks
+        let _ = forwarder.join();
     });
 
     let stream = ReceiverStream::new(rx);

@@ -713,7 +713,6 @@ dependencies = [
  "clap",
  "csm-core",
  "env_logger",
- "futures-util",
  "http",
  "hyper",
  "log",
