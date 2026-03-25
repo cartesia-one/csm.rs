@@ -72,7 +72,7 @@ struct SpeechRequest {
 fn default_temperature() -> f64 { 0.7 }
 fn default_top_k() -> usize { 100 }
 fn default_max_audio_len_ms() -> f32 { 30000.0 }
-fn default_buffer_size() -> usize { 20 }
+fn default_buffer_size() -> usize { 1 }
 
 
 #[derive(Serialize)]
