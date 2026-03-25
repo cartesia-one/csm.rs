@@ -21,6 +21,7 @@ use tokio_stream::wrappers::ReceiverStream;
 struct AppState {
     generator: Mutex<Generator>,
     api_key: Option<String>,
+    default_buffer_size: usize,
 }
 
 #[derive(Parser, Debug)]
@@ -51,6 +52,8 @@ struct Args {
     port: u16,
     #[arg(long)]
     api_key: Option<String>,
+    #[arg(long, default_value_t = 1, help = "Default buffer size for streaming (number of frames to buffer before sending). Can be overridden per-request.")]
+    buffer_size: usize,
 }
 
 #[derive(Deserialize, Debug)]
@@ -64,7 +67,7 @@ struct SpeechRequest {
     top_k: usize,
     #[serde(default = "default_max_audio_len_ms")]
     max_audio_len_ms: f32,
-    #[serde(default = "default_buffer_size")]
+    #[serde(default)]
     buffer_size: usize,
     tokenizer_template: Option<String>
 }
@@ -72,7 +75,6 @@ struct SpeechRequest {
 fn default_temperature() -> f64 { 0.7 }
 fn default_top_k() -> usize { 100 }
 fn default_max_audio_len_ms() -> f32 { 30000.0 }
-fn default_buffer_size() -> usize { 1 }
 
 
 #[derive(Serialize)]
@@ -119,6 +121,7 @@ async fn main() -> Result<()> {
     let shared_state = Arc::new(AppState {
         generator: Mutex::new(generator),
         api_key: args.api_key.clone(),
+        default_buffer_size: args.buffer_size,
     });
 
     let app = Router::new()
@@ -167,6 +170,12 @@ async fn speech_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SpeechRequest>,
 ) -> impl IntoResponse {
+    let buffer_size = if payload.buffer_size == 0 {
+        state.default_buffer_size
+    } else {
+        payload.buffer_size
+    };
+
     let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(16);
 
     let sample_rate = {
@@ -190,7 +199,7 @@ async fn speech_handler(
             payload.max_audio_len_ms,
             payload.temperature,
             payload.top_k,
-            payload.buffer_size,
+            buffer_size,
             payload.tokenizer_template,
         );
 
