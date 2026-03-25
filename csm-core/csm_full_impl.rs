@@ -241,7 +241,10 @@ impl Attention {
             )?,
         };
 
-        // Use pre-allocated KV cache: write new K/V into the buffer via slice_set
+        // Use pre-allocated KV cache: write new K/V into the buffer via slice_set.
+        // slice_set requires contiguous tensors, so ensure that here.
+        let key_states = key_states.contiguous()?;
+        let value_states = value_states.contiguous()?;
         self.ensure_kv_cache(key_states.dtype(), key_states.device())?;
         let (k_cache, v_cache) = self.kv_cache.as_mut().unwrap();
         k_cache.slice_set(&key_states, 2, self.kv_cache_len)?;
