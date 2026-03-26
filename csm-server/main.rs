@@ -51,7 +51,7 @@ struct Args {
     port: u16,
     #[arg(long)]
     api_key: Option<String>,
-    #[arg(long, default_value_t = 1, help = "Default buffer size for streaming (number of frames to buffer before sending). Can be overridden per-request.")]
+    #[arg(long, default_value_t = 10, help = "Default buffer size for streaming (number of frames to buffer before sending). Can be overridden per-request.")]
     buffer_size: usize,
 }
 
